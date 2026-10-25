@@ -11,7 +11,8 @@ from . import __version__
 from .cache import TTLCache
 from .config import MYSQL_SERVICE, REDIS_SERVICE, RSPAMD_SERVICE, PHP_SERVICE, MailcowConfig, SidecarSettings
 from .docker_exec import DockerClient, DockerError
-from .mailcow import MailcowClient
+from .mailcow import MailcowClient, WriteTargetError
+from .mailcow_api import MailcowApiClient, MailcowApiError
 from .models import (
     AliasDomainInfo,
     AliasInfo,
@@ -20,10 +21,14 @@ from .models import (
     DnsRecord,
     ExportBundle,
     MailboxInfo,
+    ReplicateRequest,
+    ReplicateResponse,
     ServiceStatus,
     StatusResponse,
+    WriteTargetStatus,
 )
-from .security import build_auth_dependency
+from .reconcile import apply_plan, build_plan, desired_from_bundle
+from .replicate import PeerError, send_bundle
 from .service import (
     collect_alias_domains,
     collect_aliases,
@@ -79,8 +84,6 @@ class AppState:
 def create_app(settings: SidecarSettings | None = None) -> FastAPI:
     settings = settings or SidecarSettings.from_env()
     state = AppState(settings)
-    auth = build_auth_dependency(settings.api_token)
-    guarded = [Depends(auth)]
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -105,6 +108,21 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
     def get_client() -> MailcowClient:
         return state.ensure()
 
+    def local_write_client(client: MailcowClient) -> MailcowApiClient:
+        """A client for this node's own mailcow (auto-derived when unconfigured)."""
+        try:
+            target = client.resolve_write_target(settings)
+        except WriteTargetError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        return MailcowApiClient(
+            target.url,
+            target.api_key,
+            verify_tls=target.verify_tls,
+            timeout=settings.target_timeout,
+        )
+
     # ------------------------------------------------------------------ meta
 
     @app.get("/", tags=["meta"])
@@ -126,6 +144,7 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
                 "/api/v1/aliases",
                 "/api/v1/alias-domains",
                 "/api/v1/export",
+                "/api/v1/replicate",
             ],
         }
 
@@ -147,9 +166,14 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ status
 
-    @app.get("/api/v1/status", response_model=StatusResponse, dependencies=guarded, tags=["meta"])
+    @app.get("/api/v1/status", response_model=StatusResponse, tags=["meta"])
     def api_status(client: MailcowClient = Depends(get_client)) -> StatusResponse:
         config = client.config
+        try:
+            target = client.resolve_write_target(settings, provision=False)
+            write_target = WriteTargetStatus(url=target.url, source=target.source)
+        except WriteTargetError:
+            write_target = WriteTargetStatus(source="unavailable")
         return StatusResponse(
             version=__version__,
             mailcow_dir=str(config.install_dir),
@@ -158,16 +182,17 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
             split_dkim_255=config.split_dkim_255,
             show_dkim_priv_keys=config.show_dkim_priv_keys,
             services=_service_statuses(client.docker),
+            write_target=write_target,
         )
 
-    @app.post("/api/v1/refresh", dependencies=guarded, tags=["meta"])
+    @app.post("/api/v1/refresh", tags=["meta"])
     def refresh(client: MailcowClient = Depends(get_client)) -> dict:
         client.invalidate_cache()
         return {"status": "ok", "detail": "cache cleared"}
 
     # ------------------------------------------------------------------ domains
 
-    @app.get("/api/v1/domains", response_model=list[DomainInfo], dependencies=guarded, tags=["domains"])
+    @app.get("/api/v1/domains", response_model=list[DomainInfo], tags=["domains"])
     def list_domains(
         include_dns: bool = Query(True, description="Include generated DNS records"),
         client: MailcowClient = Depends(get_client),
@@ -177,7 +202,6 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
     @app.get(
         "/api/v1/domains/{domain}",
         response_model=DomainInfo,
-        dependencies=guarded,
         tags=["domains"],
     )
     def get_domain(domain: str, client: MailcowClient = Depends(get_client)) -> DomainInfo:
@@ -186,17 +210,17 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"domain not found: {domain}")
         return info
 
-    @app.get("/api/v1/alias-domains", response_model=list[AliasDomainInfo], dependencies=guarded, tags=["domains"])
+    @app.get("/api/v1/alias-domains", response_model=list[AliasDomainInfo], tags=["domains"])
     def list_alias_domains(client: MailcowClient = Depends(get_client)) -> list[AliasDomainInfo]:
         return collect_alias_domains(client)
 
     # ------------------------------------------------------------------ dkim
 
-    @app.get("/api/v1/dkim", response_model=list[DkimKey], dependencies=guarded, tags=["dkim"])
+    @app.get("/api/v1/dkim", response_model=list[DkimKey], tags=["dkim"])
     def list_dkim(client: MailcowClient = Depends(get_client)) -> list[DkimKey]:
         return collect_dkim(client)
 
-    @app.get("/api/v1/dkim/{domain}", response_model=DkimKey, dependencies=guarded, tags=["dkim"])
+    @app.get("/api/v1/dkim/{domain}", response_model=DkimKey, tags=["dkim"])
     def get_dkim(domain: str, client: MailcowClient = Depends(get_client)) -> DkimKey:
         key = client.dkim_for(domain.strip().lower())
         if key is None:
@@ -205,14 +229,14 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ dns
 
-    @app.get("/api/v1/dns", response_model=dict[str, list[DnsRecord]], dependencies=guarded, tags=["dns"])
+    @app.get("/api/v1/dns", response_model=dict[str, list[DnsRecord]], tags=["dns"])
     def list_dns(
         include_srv: bool = Query(True, description="Include the SRV record set"),
         client: MailcowClient = Depends(get_client),
     ) -> dict[str, list[DnsRecord]]:
         return collect_dns(client, include_srv=include_srv)
 
-    @app.get("/api/v1/dns/{domain}", response_model=list[DnsRecord], dependencies=guarded, tags=["dns"])
+    @app.get("/api/v1/dns/{domain}", response_model=list[DnsRecord], tags=["dns"])
     def get_dns(
         domain: str,
         include_srv: bool = Query(True, description="Include the SRV record set"),
@@ -225,14 +249,14 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ mailboxes / aliases
 
-    @app.get("/api/v1/mailboxes", response_model=list[MailboxInfo], dependencies=guarded, tags=["mailboxes"])
+    @app.get("/api/v1/mailboxes", response_model=list[MailboxInfo], tags=["mailboxes"])
     def list_mailboxes(
         domain: str | None = Query(None, description="Filter by domain"),
         client: MailcowClient = Depends(get_client),
     ) -> list[MailboxInfo]:
         return collect_mailboxes(client, domain)
 
-    @app.get("/api/v1/aliases", response_model=list[AliasInfo], dependencies=guarded, tags=["aliases"])
+    @app.get("/api/v1/aliases", response_model=list[AliasInfo], tags=["aliases"])
     def list_aliases(
         domain: str | None = Query(None, description="Filter by domain"),
         client: MailcowClient = Depends(get_client),
@@ -241,18 +265,84 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ export
 
-    @app.get("/api/v1/export", response_model=ExportBundle, dependencies=guarded, tags=["export"])
+    @app.get("/api/v1/export", response_model=ExportBundle, tags=["export"])
     def export_all(client: MailcowClient = Depends(get_client)) -> ExportBundle:
         return export_bundle(client)
 
     @app.get(
         "/api/v1/domains/{domain}/export",
         response_model=DomainInfo,
-        dependencies=guarded,
         tags=["export"],
     )
     def export_domain(domain: str, client: MailcowClient = Depends(get_client)) -> DomainInfo:
         return get_domain(domain, client)
+
+    # ------------------------------------------------------------------ replicate
+
+    @app.post("/api/v1/replicate", response_model=ReplicateResponse, tags=["replicate"])
+    def replicate(
+        request: ReplicateRequest,
+        client: MailcowClient = Depends(get_client),
+    ) -> ReplicateResponse:
+        """Push this node's config to a peer, or receive a bundle to apply locally."""
+        # --- send: {"peer": "10.0.0.2"} -> scrape this node, push to the peer
+        if request.peer:
+            bundle = request.bundle or export_bundle(client)
+            verify_tls = (
+                settings.peer_verify_tls if request.verify_tls is None else request.verify_tls
+            )
+            try:
+                return send_bundle(
+                    bundle,
+                    peer=request.peer,
+                    verify_tls=verify_tls,
+                    timeout=settings.peer_timeout,
+                    prune=request.prune,
+                    include_mailboxes=request.include_mailboxes,
+                    include_domain_admins=request.include_domain_admins,
+                )
+            except PeerError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+                ) from exc
+
+        # --- receive: {"bundle": {...}} -> apply it to this node's own mailcow
+        if request.bundle is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="provide 'peer' to push, or 'bundle' to apply locally",
+            )
+
+        desired = desired_from_bundle(request.bundle)
+        api = local_write_client(client)
+        try:
+            plan = build_plan(
+                api,
+                desired,
+                target_url=api.base_url,
+                source="bundle",
+                prune=request.prune,
+                include_mailboxes=request.include_mailboxes,
+                include_domain_admins=request.include_domain_admins,
+            )
+            result = apply_plan(api, plan, desired)
+        except MailcowApiError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"write target unreachable: {exc}",
+            ) from exc
+        finally:
+            api.close()
+
+        return ReplicateResponse(
+            mode="receive",
+            domains=len(request.bundle.domains),
+            mailboxes=len(request.bundle.mailboxes),
+            aliases=len(request.bundle.aliases),
+            applied=result.applied,
+            failed=result.failed,
+            errors=result.errors,
+        )
 
     return app
 

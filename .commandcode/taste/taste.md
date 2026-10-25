@@ -1,1 +1,2 @@
 - Prefers read-only, stateless services: the app should not persist data in any database or local store — just a simple REST API that serves data on demand. Confidence: 0.6
+- Prefers skipping authentication altogether — no bearer tokens or auth scaffolding — keeping the API open and relying on localhost binding rather than adding auth complexity. Confidence: 0.55

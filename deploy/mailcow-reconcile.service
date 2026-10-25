@@ -1,0 +1,15 @@
+[Unit]
+Description=mailcow config reconciler (push this node's config to SIDECAR_TARGET_URL)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/mailcow-scraper-sidecar
+EnvironmentFile=-/opt/mailcow-scraper-sidecar/.env
+User=root
+Group=root
+# Add --prune to also delete objects missing from the source, and
+# --include-mailboxes to manage mailboxes (random password + force_pw_update).
+ExecStart=/opt/mailcow-scraper-sidecar/.venv/bin/python -m app.reconcile --source local --apply

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -79,6 +81,16 @@ class ServiceStatus(BaseModel):
     error: str | None = None
 
 
+class WriteTargetStatus(BaseModel):
+    url: str | None = None
+    source: str | None = Field(
+        default=None,
+        description=(
+            "configured | existing-key | created-key | auto-create | unavailable"
+        ),
+    )
+
+
 class StatusResponse(BaseModel):
     version: str
     mailcow_dir: str
@@ -87,10 +99,124 @@ class StatusResponse(BaseModel):
     split_dkim_255: bool
     show_dkim_priv_keys: bool
     services: list[ServiceStatus]
+    write_target: WriteTargetStatus | None = None
+
+
+class RelayhostInfo(BaseModel):
+    """SMTP relay credentials. mailcow stores the password in the clear, so it
+    round-trips exactly (a literal ``:`` is escaped by mailcow on write)."""
+
+    hostname: str = Field(description="host:port, e.g. mail.relay.tld:587")
+    username: str | None = None
+    password: str | None = None
+    active: bool = True
+    id: int | None = None
+
+
+class TransportInfo(BaseModel):
+    """Sender-dependent transport credentials (also stored in the clear)."""
+
+    destination: str
+    nexthop: str
+    username: str | None = None
+    password: str | None = None
+    is_mx_based: bool = False
+    active: bool = True
+    id: int | None = None
+
+
+class DomainAdminInfo(BaseModel):
+    """A domain-admin *account*. Its password is hashed and never readable, so
+    the account can be recreated but not with the original password."""
+
+    username: str
+    domains: list[str] = Field(default_factory=list)
+    active: bool = True
 
 
 class ExportBundle(BaseModel):
+    """A complete, portable snapshot of a mailcow instance's configuration."""
+
     generated_at: str
     mailcow_hostname: str
     domains: list[DomainInfo]
     alias_domains: list[AliasDomainInfo]
+    mailboxes: list[MailboxInfo] = Field(default_factory=list)
+    aliases: list[AliasInfo] = Field(default_factory=list)
+    relayhosts: list[RelayhostInfo] = Field(default_factory=list)
+    transports: list[TransportInfo] = Field(default_factory=list)
+    domain_admins: list[DomainAdminInfo] = Field(default_factory=list)
+
+
+ActionKind = Literal[
+    "domain", "dkim", "alias", "alias-domain", "mailbox", "relayhost", "transport", "domain-admin"
+]
+ActionType = Literal["create", "update", "delete", "import-dkim"]
+
+
+class ReconcileAction(BaseModel):
+    kind: ActionKind
+    action: ActionType
+    target: str
+    detail: str
+    payload: dict | None = Field(
+        default=None, description="Non-secret API body; DKIM private keys are never included"
+    )
+
+
+class ReconcilePlan(BaseModel):
+    target_url: str
+    source: str = Field(description='"local" (scraped here) or "bundle" (supplied)')
+    generated_at: str
+    prune: bool
+    include_mailboxes: bool
+    actions: list[ReconcileAction]
+    counts: dict[str, int]
+
+
+class ReconcileResult(BaseModel):
+    plan: ReconcilePlan
+    applied: int
+    failed: int
+    errors: list[str] = Field(default_factory=list)
+
+
+class ReplicateRequest(BaseModel):
+    """One route, two directions.
+
+    * **send** — set ``peer`` to push this node's configuration to another sidecar.
+    * **receive** — post a ``bundle`` to apply it to this node's own mailcow.
+    """
+
+    peer: str | None = Field(
+        default=None,
+        description="Peer to push to, e.g. 10.0.0.2:8800 or https://10.0.0.2:8800",
+    )
+    verify_tls: bool | None = Field(
+        default=None, description="Override TLS verification for this push"
+    )
+    bundle: ExportBundle | None = Field(
+        default=None,
+        description="Send mode: override the source bundle (defaults to scraping this node). "
+        "Receive mode: the configuration to apply locally.",
+    )
+    prune: bool = Field(default=False, description="Also delete what is absent from the source")
+    include_mailboxes: bool = Field(
+        default=False,
+        description="Include mailboxes (account only; random password + force_pw_update)",
+    )
+    include_domain_admins: bool = Field(
+        default=False,
+        description="Include domain-admin accounts (random password; the original is unreadable)",
+    )
+
+
+class ReplicateResponse(BaseModel):
+    mode: Literal["send", "receive"]
+    peer: str | None = None
+    domains: int | None = None
+    mailboxes: int | None = None
+    aliases: int | None = None
+    applied: int = 0
+    failed: int = 0
+    errors: list[str] = Field(default_factory=list)

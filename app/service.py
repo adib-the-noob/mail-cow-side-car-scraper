@@ -10,10 +10,13 @@ from .models import (
     AliasDomainInfo,
     AliasInfo,
     DkimKey,
+    DomainAdminInfo,
     DomainInfo,
     DnsRecord,
     ExportBundle,
     MailboxInfo,
+    RelayhostInfo,
+    TransportInfo,
 )
 
 
@@ -82,11 +85,37 @@ def collect_domains(client: MailcowClient, *, include_dns: bool = True) -> list[
     dkim_map = client.dkim_keys()
     alias_domains = _alias_domain_set(client)
     rows = client.domains()
-    infos = [
-        build_domain_info(client, row, dkim_map, alias_domains, include_dns=include_dns)
-        for row in rows
-    ]
-    return sorted(infos, key=lambda info: info.domain)
+
+    by_name: dict[str, DomainInfo] = {}
+    for row in rows:
+        info = build_domain_info(client, row, dkim_map, alias_domains, include_dns=include_dns)
+        by_name[info.domain] = info
+
+    # Alias domains live in their own table but still need MX/DKIM records.
+    for row in client.alias_domains():
+        name = row.get("alias_domain")
+        if not name:
+            continue
+        if name in by_name:
+            by_name[name].is_alias_domain = True
+            continue
+        info = DomainInfo(
+            domain=name,
+            is_alias_domain=True,
+            active=_to_bool(row.get("active"), True),
+            dkim=dkim_map.get(name),
+        )
+        if include_dns:
+            info.dns = build_dns_records(
+                name,
+                hostname=client.config.hostname,
+                https_port=client.config.https_port,
+                dkim=info.dkim,
+                is_alias_domain=True,
+            )
+        by_name[name] = info
+
+    return sorted(by_name.values(), key=lambda info: info.domain)
 
 
 def collect_alias_domains(client: MailcowClient) -> list[AliasDomainInfo]:
@@ -172,10 +201,62 @@ def domain_bundle(client: MailcowClient, domain: str) -> DomainInfo | None:
     return None
 
 
+def collect_relayhosts(client: MailcowClient) -> list[RelayhostInfo]:
+    return [
+        RelayhostInfo(
+            hostname=row["hostname"],
+            username=row.get("username"),
+            password=row.get("password"),
+            active=_to_bool(row.get("active"), True),
+            id=_to_int(row.get("id")),
+        )
+        for row in client.relayhosts()
+    ]
+
+
+def collect_transports(client: MailcowClient) -> list[TransportInfo]:
+    return [
+        TransportInfo(
+            destination=row["destination"],
+            nexthop=row["nexthop"],
+            username=row.get("username"),
+            password=row.get("password"),
+            is_mx_based=_to_bool(row.get("is_mx_based")),
+            active=_to_bool(row.get("active"), True),
+            id=_to_int(row.get("id")),
+        )
+        for row in client.transports()
+    ]
+
+
+def collect_domain_admins(client: MailcowClient) -> list[DomainAdminInfo]:
+    """Group the flat (username, domain) rows coming out of the admin/domain_admins join."""
+    grouped: dict[str, dict] = {}
+    for row in client.domain_admins():
+        username = row.get("username")
+        if not username:
+            continue
+        entry = grouped.setdefault(
+            username,
+            {"username": username, "active": _to_bool(row.get("active"), True), "domains": set()},
+        )
+        if row.get("domain"):
+            entry["domains"].add(row["domain"])
+    return [
+        DomainAdminInfo(username=entry["username"], active=entry["active"], domains=sorted(entry["domains"]))
+        for entry in sorted(grouped.values(), key=lambda e: e["username"])
+    ]
+
+
 def export_bundle(client: MailcowClient) -> ExportBundle:
     return ExportBundle(
         generated_at=datetime.now(timezone.utc).isoformat(),
         mailcow_hostname=client.config.hostname,
         domains=collect_domains(client, include_dns=True),
         alias_domains=collect_alias_domains(client),
+        mailboxes=collect_mailboxes(client),
+        aliases=collect_aliases(client),
+        relayhosts=collect_relayhosts(client),
+        transports=collect_transports(client),
+        domain_admins=collect_domain_admins(client),
     )

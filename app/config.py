@@ -83,12 +83,22 @@ class SidecarSettings:
 
     host: str = "127.0.0.1"
     port: int = 8800
-    api_token: str | None = None
     docker_bin: str = "docker"
     request_timeout: float = 30.0
     cache_ttl: float = 30.0
     mailcow_dir: str | None = None
     compose_project: str | None = None
+    # Reconciler target (another mailcow node). Optional; enables the write side.
+    target_url: str | None = None
+    target_api_key: str | None = None
+    target_verify_tls: bool = True
+    target_timeout: float = 30.0
+    # When no target is configured, derive it from mailcow.conf and reuse (or
+    # create) an rw API key in this node's own mailcow.
+    auto_api_key: bool = True
+    # Replication peer defaults (a peer is another sidecar).
+    peer_verify_tls: bool = True
+    peer_timeout: float = 120.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SidecarSettings":
@@ -96,12 +106,18 @@ class SidecarSettings:
         return cls(
             host=env.get("SIDECAR_HOST", "127.0.0.1"),
             port=_as_int(env.get("SIDECAR_PORT"), 8800),
-            api_token=env.get("SIDECAR_API_TOKEN") or None,
             docker_bin=env.get("SIDECAR_DOCKER_BIN", "docker"),
             request_timeout=float(env.get("SIDECAR_REQUEST_TIMEOUT", "30")),
             cache_ttl=float(env.get("SIDECAR_CACHE_TTL", "30")),
             mailcow_dir=env.get("SIDECAR_MAILCOW_DIR") or env.get("MAILCOW_DIR"),
             compose_project=env.get("SIDECAR_COMPOSE_PROJECT") or env.get("COMPOSE_PROJECT_NAME"),
+            target_url=env.get("SIDECAR_TARGET_URL") or None,
+            target_api_key=env.get("SIDECAR_TARGET_API_KEY") or None,
+            target_verify_tls=_as_bool(env.get("SIDECAR_TARGET_VERIFY_TLS"), True),
+            target_timeout=float(env.get("SIDECAR_TARGET_TIMEOUT", "30")),
+            auto_api_key=_as_bool(env.get("SIDECAR_AUTO_API_KEY"), True),
+            peer_verify_tls=_as_bool(env.get("SIDECAR_PEER_VERIFY_TLS"), True),
+            peer_timeout=float(env.get("SIDECAR_PEER_TIMEOUT", "120")),
         )
 
 
