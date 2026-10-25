@@ -126,18 +126,6 @@ class ReconcilePlan(BaseModel):
     counts: dict[str, int]
 
 
-class ReconcileRequest(BaseModel):
-    bundle: ExportBundle | None = Field(
-        default=None,
-        description="Desired state. When omitted, this node is scraped and used as the source.",
-    )
-    prune: bool = Field(default=False, description="Also delete objects absent from desired state")
-    include_mailboxes: bool = Field(
-        default=False,
-        description="Manage mailboxes too (existence/quota/active; passwords cannot be synced)",
-    )
-
-
 class ReconcileResult(BaseModel):
     plan: ReconcilePlan
     applied: int
@@ -145,46 +133,37 @@ class ReconcileResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
-class PeerProbeRequest(BaseModel):
-    peer_url: str = Field(description="Base URL of the peer sidecar, e.g. https://node2:8800")
-    peer_token: str | None = Field(
-        default=None, description="Peer's SIDECAR_API_TOKEN, if it has one"
-    )
-    peer_verify_tls: bool | None = None
-
-
-class PeerInfo(BaseModel):
-    url: str
-    reachable: bool
-    authenticated: bool | None = None
-    mailcow_hostname: str | None = None
-    compose_project: str | None = None
-    version: str | None = None
-    detail: str | None = None
-
-
 class ReplicateRequest(BaseModel):
-    """Push this node's configuration to a peer, which applies it to its own mailcow."""
+    """One route, two directions.
 
-    peer_url: str = Field(description="Base URL of the peer sidecar, e.g. https://node2:8800")
-    peer_token: str | None = Field(
-        default=None, description="Peer's SIDECAR_API_TOKEN, if it has one"
+    * **send** — set ``peer`` to push this node's configuration to another sidecar.
+    * **receive** — post a ``bundle`` to apply it to this node's own mailcow.
+    """
+
+    peer: str | None = Field(
+        default=None,
+        description="Peer to push to, e.g. 10.0.0.2:8800 or https://10.0.0.2:8800",
     )
-    peer_verify_tls: bool | None = None
+    verify_tls: bool | None = Field(
+        default=None, description="Override TLS verification for this push"
+    )
     bundle: ExportBundle | None = Field(
-        default=None, description="Override the source bundle; by default this node is scraped"
+        default=None,
+        description="Send mode: override the source bundle (defaults to scraping this node). "
+        "Receive mode: the configuration to apply locally.",
     )
-    prune: bool = Field(default=False, description="Also delete on the peer what is absent here")
+    prune: bool = Field(default=False, description="Also delete what is absent from the source")
     include_mailboxes: bool = Field(
-        default=False, description="Push mailboxes too (random password + force_pw_update)"
+        default=False, description="Include mailboxes (random password + force_pw_update)"
     )
 
 
-class ReplicateResult(BaseModel):
-    peer_url: str
-    pushed_at: str
-    mailcow_hostname: str
-    domains: int
-    mailboxes: int
-    aliases: int
-    peer_result: ReconcileResult | None = None
+class ReplicateResponse(BaseModel):
+    mode: Literal["send", "receive"]
+    peer: str | None = None
+    domains: int | None = None
+    mailboxes: int | None = None
+    aliases: int | None = None
+    applied: int = 0
+    failed: int = 0
+    errors: list[str] = Field(default_factory=list)

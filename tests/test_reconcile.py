@@ -296,9 +296,15 @@ def test_api_client_reports_forbidden() -> None:
 # ---------------------------------------------------------------------- endpoints
 
 
-def test_reconcile_endpoints_need_target(client: TestClient) -> None:
-    response = client.post("/api/v1/reconcile/plan", json={})
+def test_receive_without_target_reports_503(client: TestClient) -> None:
+    """Receive mode needs this node's own mailcow configured as the write target."""
+    bundle = _desired_bundle().model_dump(mode="json")
+    response = client.post("/api/v1/replicate", json={"bundle": bundle})
     assert response.status_code == 503
-    assert "target not configured" in response.json()["detail"]
+    assert "no write target configured" in response.json()["detail"]
 
-    assert client.get("/api/v1/reconcile/target").status_code == 503
+
+def test_replicate_requires_peer_or_bundle(client: TestClient) -> None:
+    response = client.post("/api/v1/replicate", json={})
+    assert response.status_code == 400
+    assert "provide 'peer'" in response.json()["detail"]

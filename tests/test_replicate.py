@@ -1,4 +1,4 @@
-"""Peer-to-peer replication tests against a fake peer sidecar."""
+"""Replication tests: the single ``/api/v1/replicate`` route and its client."""
 
 from __future__ import annotations
 
@@ -9,88 +9,45 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.replicate as replicate_module
+from app.config import SidecarSettings
+from app.mailcow_api import MailcowApiClient
+from app.main import create_app
 from app.models import DkimKey, DomainInfo, ExportBundle
-from app.replicate import PeerClient, PeerError, preview_bundle, push_bundle
+from app.replicate import PeerClient, PeerError, normalize_peer_url, send_bundle
 
 
 class FakePeer:
-    """A fake sidecar: /health, /api/v1/status, reconcile/plan and reconcile/apply."""
+    """A fake *receiving* sidecar: ``POST /api/v1/replicate``."""
 
-    def __init__(self, hostname: str = "node2.example.org", token: str | None = None) -> None:
-        self.hostname = hostname
-        self.token = token
-        self.applied: list[dict] = []
-        self.planned: list[dict] = []
-
-    @property
-    def requests(self) -> list[dict]:
-        return self.applied
-
-    def _plan_json(self, body: dict) -> dict:
-        return {
-            "target_url": "https://node2",
-            "source": "bundle",
-            "generated_at": "2024-01-01T00:00:00Z",
-            "prune": body.get("prune", False),
-            "include_mailboxes": body.get("include_mailboxes", False),
-            "actions": [
-                {
-                    "kind": "domain",
-                    "action": "create",
-                    "target": "example.org",
-                    "detail": "domain missing on target",
-                    "payload": {"domain": "example.org"},
-                }
-            ],
-            "counts": {"create": 1},
-        }
+    def __init__(self, status_code: int = 200, detail: str = "nope") -> None:
+        self.status_code = status_code
+        self.detail = detail
+        self.received: list[dict] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        # /health is public, exactly like the real app; /api/v1/* needs the token.
-        if path.startswith("/api/v1/") and self.token is not None:
-            if request.headers.get("Authorization") != f"Bearer {self.token}":
-                return httpx.Response(401, json={"detail": "invalid or missing bearer token"})
-
-        if path == "/health":
-            return httpx.Response(200, json={"status": "ok", "ready": True, "services": []})
-        if path == "/api/v1/status":
+        if request.url.path == "/api/v1/replicate":
+            body = json.loads(request.content)
+            self.received.append(body)
+            if self.status_code >= 400:
+                return httpx.Response(self.status_code, json={"detail": self.detail})
             return httpx.Response(
                 200,
                 json={
-                    "version": "1.0.0",
-                    "mailcow_dir": "/opt/mailcow-dockerized",
-                    "mailcow_hostname": self.hostname,
-                    "compose_project": "mailcowdockerized",
-                    "split_dkim_255": False,
-                    "show_dkim_priv_keys": False,
-                    "services": [],
-                },
-            )
-        if path == "/api/v1/reconcile/plan":
-            body = json.loads(request.content)
-            self.planned.append(body)
-            return httpx.Response(200, json=self._plan_json(body))
-
-        if path == "/api/v1/reconcile/apply":
-            body = json.loads(request.content)
-            self.applied.append(body)
-            return httpx.Response(
-                200,
-                json={
-                    "plan": self._plan_json(body),
-                    "applied": 1,
+                    "mode": "receive",
+                    "domains": len(body["bundle"]["domains"]),
+                    "mailboxes": 0,
+                    "aliases": 0,
+                    "applied": 3,
                     "failed": 0,
                     "errors": [],
                 },
             )
         return httpx.Response(404, json={"detail": "route not found"})
 
-    def factory(self, base_url, token=None, *, verify_tls=True, timeout=120.0):
+    def factory(self, base_url, *, verify_tls=True, timeout=120.0):
         """Stand-in for PeerClient that talks to this fake."""
         return PeerClient(
             base_url,
-            token,
             client=httpx.Client(transport=httpx.MockTransport(self.handler), base_url=base_url),
         )
 
@@ -116,159 +73,165 @@ def _bundle() -> ExportBundle:
     )
 
 
-# ---------------------------------------------------------------------- peer client
+# ---------------------------------------------------------------------- url normalisation
 
 
-def test_probe_peer_reports_hostname() -> None:
-    peer = FakePeer(hostname="node2.example.org")
-    info = PeerClient(
-        "https://node2", "tok", client=httpx.Client(transport=httpx.MockTransport(peer.handler), base_url="https://node2")
-    ).info()
-    assert info.reachable is True
-    assert info.authenticated is True
-    assert info.mailcow_hostname == "node2.example.org"
-    assert info.version == "1.0.0"
+@pytest.mark.parametrize(
+    ("peer", "expected"),
+    [
+        ("10.0.0.2", "http://10.0.0.2:8800"),
+        ("10.0.0.2:9000", "http://10.0.0.2:9000"),
+        ("10.0.0.2/", "http://10.0.0.2:8800"),
+        ("https://mail.example.org", "https://mail.example.org"),
+        ("https://mail.example.org/", "https://mail.example.org"),
+        ("http://10.0.0.2:8800", "http://10.0.0.2:8800"),
+    ],
+)
+def test_normalize_peer_url(peer: str, expected: str) -> None:
+    assert normalize_peer_url(peer) == expected
 
 
-def test_probe_peer_without_token() -> None:
+def test_normalize_peer_url_rejects_empty() -> None:
+    with pytest.raises(PeerError):
+        normalize_peer_url("   ")
+
+
+# ---------------------------------------------------------------------- client
+
+
+def test_send_bundle_posts_bundle_to_peer() -> None:
     peer = FakePeer()
-    info = PeerClient(
-        "https://node2", None, client=httpx.Client(transport=httpx.MockTransport(peer.handler), base_url="https://node2")
-    ).info()
-    assert info.reachable is True
-    assert info.authenticated is None
-    assert "no peer token" in (info.detail or "")
-
-
-def test_probe_peer_with_bad_token() -> None:
-    peer = FakePeer(token="right")
-    info = PeerClient(
-        "https://node2", "wrong", client=httpx.Client(transport=httpx.MockTransport(peer.handler), base_url="https://node2")
-    ).info()
-    assert info.reachable is True
-    assert info.authenticated is False
-
-
-def test_probe_peer_unreachable() -> None:
-    def boom(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("nope", request=request)
-
-    info = PeerClient(
-        "https://node2", None, client=httpx.Client(transport=httpx.MockTransport(boom), base_url="https://node2")
-    ).info()
-    assert info.reachable is False
-    assert "cannot reach peer" in (info.detail or "")
-
-
-def test_push_bundle_sends_bundle_and_returns_result() -> None:
-    peer = FakePeer()
-
-    # push_bundle builds its own client; patch PeerClient to use the fake transport.
     original = replicate_module.PeerClient
     replicate_module.PeerClient = peer.factory  # type: ignore[assignment]
     try:
-        result = push_bundle(_bundle(), peer_url="https://node2", prune=False)
+        result = send_bundle(_bundle(), peer="10.0.0.2")
     finally:
         replicate_module.PeerClient = original  # type: ignore[assignment]
 
-    assert result.mailcow_hostname == "mail.example.org"
+    assert result.mode == "send"
+    assert result.peer == "http://10.0.0.2:8800"
     assert result.domains == 1
-    assert result.peer_result is not None
-    assert result.peer_result.applied == 1
+    assert result.applied == 3
 
-    sent = peer.applied[0]
+    sent = peer.received[0]
     assert sent["bundle"]["mailcow_hostname"] == "mail.example.org"
     # Private keys travel with the bundle so the peer signs identically.
     assert sent["bundle"]["domains"][0]["dkim"]["private_key"].startswith("-----BEGIN")
 
 
-def test_push_bundle_surfaces_auth_failure() -> None:
-    peer = FakePeer(token="right")
+def test_send_bundle_surfaces_peer_error() -> None:
+    peer = FakePeer(status_code=503, detail="no write target configured")
     original = replicate_module.PeerClient
     replicate_module.PeerClient = peer.factory  # type: ignore[assignment]
     try:
         with pytest.raises(PeerError) as exc:
-            push_bundle(_bundle(), peer_url="https://node2", token="wrong")
+            send_bundle(_bundle(), peer="https://node2")
     finally:
         replicate_module.PeerClient = original  # type: ignore[assignment]
-    assert exc.value.status_code == 401
+
+    assert exc.value.status_code == 503
+    assert "no write target configured" in str(exc.value)
 
 
-# ---------------------------------------------------------------------- endpoints
+def test_send_bundle_unreachable_peer() -> None:
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("nope", request=request)
 
+    def factory(base_url, *, verify_tls=True, timeout=120.0):
+        return PeerClient(
+            base_url,
+            client=httpx.Client(transport=httpx.MockTransport(boom), base_url=base_url),
+        )
 
-def test_preview_bundle_returns_plan_without_writing() -> None:
-    peer = FakePeer()
     original = replicate_module.PeerClient
-    replicate_module.PeerClient = peer.factory  # type: ignore[assignment]
+    replicate_module.PeerClient = factory  # type: ignore[assignment]
     try:
-        plan = preview_bundle(_bundle(), peer_url="https://node2")
+        with pytest.raises(PeerError) as exc:
+            send_bundle(_bundle(), peer="https://node2")
     finally:
         replicate_module.PeerClient = original  # type: ignore[assignment]
 
-    assert plan.counts == {"create": 1}
-    assert plan.actions[0].target == "example.org"
-    assert peer.applied == []  # preview must not write
-    assert len(peer.planned) == 1
+    assert "cannot reach peer" in str(exc.value)
 
 
-def test_replicate_preview_endpoint(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    peer = FakePeer()
-    monkeypatch.setattr(replicate_module, "PeerClient", peer.factory)
-
-    response = client.post("/api/v1/replicate/preview", json={"peer_url": "https://node2"})
-    assert response.status_code == 200
-    assert response.json()["counts"] == {"create": 1}
-    assert peer.applied == []
+# ---------------------------------------------------------------------- endpoint
 
 
-def test_replicate_push_endpoint(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_replicate_send_mode(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     peer = FakePeer()
     monkeypatch.setattr(replicate_module, "PeerClient", peer.factory)
 
     # Scrapes the local (stub) node and pushes to the fake peer.
     response = client.post(
-        "/api/v1/replicate/push",
-        json={"peer_url": "https://node2", "include_mailboxes": True},
+        "/api/v1/replicate", json={"peer": "10.0.0.2", "include_mailboxes": True}
     )
     assert response.status_code == 200
     body = response.json()
+    assert body["mode"] == "send"
+    assert body["peer"] == "http://10.0.0.2:8800"
     assert body["domains"] == 2  # example.org + alias.example.net
     assert body["aliases"] == 1
-    assert body["peer_result"]["applied"] == 1
+    assert body["applied"] == 3
 
-    sent = peer.applied[0]
+    sent = peer.received[0]
     assert sent["include_mailboxes"] is True
     assert {d["domain"] for d in sent["bundle"]["domains"]} == {"example.org", "alias.example.net"}
 
 
-def test_replicate_peer_endpoint(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    peer = FakePeer(hostname="node2.example.org")
-    monkeypatch.setattr(replicate_module, "PeerClient", peer.factory)
-
-    response = client.post(
-        "/api/v1/replicate/peer", json={"peer_url": "https://node2", "peer_token": "tok"}
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["reachable"] is True
-    assert body["mailcow_hostname"] == "node2.example.org"
-
-
-def test_replicate_push_reports_unreachable_peer(
+def test_replicate_send_mode_reports_unreachable_peer(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def boom(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("nope", request=request)
 
-    def factory(base_url, token=None, *, verify_tls=True, timeout=120.0):
+    def factory(base_url, *, verify_tls=True, timeout=120.0):
         return PeerClient(
             base_url,
-            token,
             client=httpx.Client(transport=httpx.MockTransport(boom), base_url=base_url),
         )
 
     monkeypatch.setattr(replicate_module, "PeerClient", factory)
-    response = client.post("/api/v1/replicate/push", json={"peer_url": "https://node2"})
+    response = client.post("/api/v1/replicate", json={"peer": "10.0.0.2"})
     assert response.status_code == 502
     assert "cannot reach peer" in response.json()["detail"]
+
+
+def test_replicate_receive_mode(
+    mailcow_dir, stub_docker: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Export from this node, then post the bundle back to apply it locally."""
+    writes: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[])  # target starts empty -> everything creates
+        writes.append(request.url.path)
+        return httpx.Response(200, json={"type": "success", "msg": ["ok"]})
+
+    def fake_api(base_url, api_key, *, verify_tls=True, timeout=30.0):
+        return MailcowApiClient(
+            base_url,
+            api_key,
+            client=httpx.Client(transport=httpx.MockTransport(handler), base_url=base_url),
+        )
+
+    monkeypatch.setattr("app.main.MailcowApiClient", fake_api)
+
+    settings = SidecarSettings(
+        mailcow_dir=str(mailcow_dir),
+        docker_bin=stub_docker,
+        cache_ttl=0,
+        target_url="https://node2.test",
+        target_api_key="rw-key",
+    )
+    app = create_app(settings)
+    with TestClient(app) as test_client:
+        bundle = test_client.get("/api/v1/export").json()
+        response = test_client.post("/api/v1/replicate", json={"bundle": bundle})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "receive"
+    assert body["failed"] == 0
+    assert body["applied"] > 0
+    assert "/api/v1/add/domain" in writes

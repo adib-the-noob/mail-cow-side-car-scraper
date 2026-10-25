@@ -82,15 +82,3 @@ def test_export_bundle(client: TestClient) -> None:
     assert bundle["mailcow_hostname"] == "mail.example.org"
     assert len(bundle["domains"]) == 2
     assert bundle["generated_at"]
-
-
-def test_bearer_auth_enforced(authed_client: TestClient) -> None:
-    assert authed_client.get("/api/v1/domains").status_code == 401
-
-    ok = authed_client.get(
-        "/api/v1/domains", headers={"Authorization": "Bearer s3cret"}
-    )
-    assert ok.status_code == 200
-
-    # Health/root stay open.
-    assert authed_client.get("/health").status_code == 200

@@ -83,7 +83,6 @@ class SidecarSettings:
 
     host: str = "127.0.0.1"
     port: int = 8800
-    api_token: str | None = None
     docker_bin: str = "docker"
     request_timeout: float = 30.0
     cache_ttl: float = 30.0
@@ -95,7 +94,6 @@ class SidecarSettings:
     target_verify_tls: bool = True
     target_timeout: float = 30.0
     # Replication peer defaults (a peer is another sidecar).
-    peer_token: str | None = None
     peer_verify_tls: bool = True
     peer_timeout: float = 120.0
 
@@ -105,7 +103,6 @@ class SidecarSettings:
         return cls(
             host=env.get("SIDECAR_HOST", "127.0.0.1"),
             port=_as_int(env.get("SIDECAR_PORT"), 8800),
-            api_token=env.get("SIDECAR_API_TOKEN") or None,
             docker_bin=env.get("SIDECAR_DOCKER_BIN", "docker"),
             request_timeout=float(env.get("SIDECAR_REQUEST_TIMEOUT", "30")),
             cache_ttl=float(env.get("SIDECAR_CACHE_TTL", "30")),
@@ -115,7 +112,6 @@ class SidecarSettings:
             target_api_key=env.get("SIDECAR_TARGET_API_KEY") or None,
             target_verify_tls=_as_bool(env.get("SIDECAR_TARGET_VERIFY_TLS"), True),
             target_timeout=float(env.get("SIDECAR_TARGET_TIMEOUT", "30")),
-            peer_token=env.get("SIDECAR_PEER_TOKEN") or None,
             peer_verify_tls=_as_bool(env.get("SIDECAR_PEER_VERIFY_TLS"), True),
             peer_timeout=float(env.get("SIDECAR_PEER_TIMEOUT", "120")),
         )

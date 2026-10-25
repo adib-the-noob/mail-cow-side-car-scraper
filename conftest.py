@@ -48,24 +48,16 @@ def mailcow_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _settings(mailcow_dir: Path, stub_docker: str, token: str | None = None) -> SidecarSettings:
+def _settings(mailcow_dir: Path, stub_docker: str) -> SidecarSettings:
     return SidecarSettings(
         mailcow_dir=str(mailcow_dir),
         docker_bin=stub_docker,
         cache_ttl=0,
-        api_token=token,
     )
 
 
 @pytest.fixture
 def client(mailcow_dir: Path, stub_docker: str) -> TestClient:
     app = create_app(_settings(mailcow_dir, stub_docker))
-    with TestClient(app) as test_client:
-        yield test_client
-
-
-@pytest.fixture
-def authed_client(mailcow_dir: Path, stub_docker: str) -> TestClient:
-    app = create_app(_settings(mailcow_dir, stub_docker, token="s3cret"))
     with TestClient(app) as test_client:
         yield test_client

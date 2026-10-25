@@ -1,23 +1,26 @@
 """Peer-to-peer replication between two sidecars.
 
-Topology: Node 1 runs a *full* mailcow; Node 2 runs a *fresh* mailcow. Both run
-this sidecar. You paste Node 2's URL into Node 1, Node 1 scrapes itself and
-POSTs the resulting bundle to Node 2's ``/api/v1/reconcile/apply``, and Node 2
-provisions its own containers from it.
+Node 1 runs a *full* mailcow; Node 2 runs a *fresh* mailcow. Both run this
+sidecar. You POST Node 2's address to Node 1 and Node 1 ships its configuration
+to Node 2, which applies it to its own mailcow.
 
-Node 2 therefore needs its own write path configured
-(``SIDECAR_TARGET_URL`` pointing at its own mailcow + an ``rw`` API key); the
-receiver-facing apply logic lives in :mod:`app.reconcile` and is reused as-is.
+The whole feature is one route on both ends:
+
+* **send** — ``POST /api/v1/replicate {"peer": "10.0.0.2"}`` scrapes this node and
+  POSTs the bundle to ``{peer}/api/v1/replicate``.
+* **receive** — ``POST /api/v1/replicate {"bundle": {...}}`` applies that bundle
+  to this node's own mailcow (via ``SIDECAR_TARGET_URL``).
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
-from .models import ExportBundle, PeerInfo, ReconcilePlan, ReconcileResult, ReplicateResult
+from .models import ExportBundle, ReplicateResponse
+
+DEFAULT_PEER_PORT = 8800
 
 
 class PeerError(RuntimeError):
@@ -27,27 +30,45 @@ class PeerError(RuntimeError):
         self.payload = payload
 
 
+def _has_port(host: str) -> bool:
+    if host.startswith("["):  # IPv6 literal, e.g. [::1]:8800
+        return "]:" in host
+    return ":" in host
+
+
+def normalize_peer_url(peer: str) -> str:
+    """Accept a bare IP/host and turn it into a base URL.
+
+    ``10.0.0.2`` -> ``http://10.0.0.2:8800``
+    ``10.0.0.2:9000`` -> ``http://10.0.0.2:9000``
+    ``https://mail.example.org`` -> unchanged
+    """
+    peer = peer.strip().rstrip("/")
+    if not peer:
+        raise PeerError("empty peer address")
+
+    if "://" not in peer:
+        host = peer if _has_port(peer) else f"{peer}:{DEFAULT_PEER_PORT}"
+        peer = f"http://{host}"
+    return peer
+
+
 class PeerClient:
-    """Client for another sidecar's HTTP API."""
+    """Client for another sidecar's ``/api/v1/replicate``."""
 
     def __init__(
         self,
         base_url: str,
-        token: str | None = None,
         *,
         verify_tls: bool = True,
         timeout: float = 120.0,
         client: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.token = token
-        headers = {"Accept": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
         self._owns_client = client is None
         self._client = client or httpx.Client(
             base_url=self.base_url,
-            headers=headers,
+            headers={"Accept": "application/json"},
             verify=verify_tls,
             timeout=timeout,
             follow_redirects=True,
@@ -63,9 +84,10 @@ class PeerClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _request(self, method: str, path: str, json_body: Any = None) -> Any:
+    def send(self, bundle: dict, *, prune: bool = False, include_mailboxes: bool = False) -> dict:
+        body = {"bundle": bundle, "prune": prune, "include_mailboxes": include_mailboxes}
         try:
-            response = self._client.request(method, path, json=json_body)
+            response = self._client.post("/api/v1/replicate", json=body)
         except httpx.HTTPError as exc:
             raise PeerError(f"cannot reach peer {self.base_url}: {exc}") from exc
 
@@ -74,122 +96,47 @@ class PeerClient:
         except ValueError:
             payload = None
 
-        if response.status_code == 401:
-            raise PeerError("peer rejected the token (401)", 401, payload)
         if response.status_code >= 400:
             detail = payload.get("detail") if isinstance(payload, dict) else payload
             raise PeerError(
-                f"peer returned HTTP {response.status_code}: {detail}", response.status_code, payload
+                f"peer returned HTTP {response.status_code}: {detail}",
+                response.status_code,
+                payload,
             )
         if payload is None:
             raise PeerError("peer returned a non-JSON response", response.status_code)
         return payload
 
-    # ------------------------------------------------------------------ probes
 
-    def info(self) -> PeerInfo:
-        info = PeerInfo(url=self.base_url, reachable=False)
-        try:
-            health = self._request("GET", "/health")
-        except PeerError as exc:
-            info.detail = str(exc)
-            return info
-
-        info.reachable = True
-        if not isinstance(health, dict):
-            return info
-
-        if self.token:
-            try:
-                status = self._request("GET", "/api/v1/status")
-                info.authenticated = True
-                info.mailcow_hostname = status.get("mailcow_hostname")
-                info.compose_project = status.get("compose_project")
-                info.version = status.get("version")
-            except PeerError as exc:
-                info.authenticated = False
-                info.detail = str(exc)
-        else:
-            info.detail = "no peer token supplied; only the unauthenticated /health probe ran"
-        return info
-
-    # ------------------------------------------------------------------ push
-
-    def plan(
-        self, bundle: dict, *, prune: bool = False, include_mailboxes: bool = False
-    ) -> dict:
-        return self._request(
-            "POST",
-            "/api/v1/reconcile/plan",
-            {"bundle": bundle, "prune": prune, "include_mailboxes": include_mailboxes},
-        )
-
-    def apply(
-        self, bundle: dict, *, prune: bool = False, include_mailboxes: bool = False
-    ) -> dict:
-        return self._request(
-            "POST",
-            "/api/v1/reconcile/apply",
-            {"bundle": bundle, "prune": prune, "include_mailboxes": include_mailboxes},
-        )
-
-
-def probe_peer(
-    peer_url: str,
-    *,
-    token: str | None = None,
-    verify_tls: bool = True,
-    timeout: float = 120.0,
-) -> PeerInfo:
-    with PeerClient(peer_url, token, verify_tls=verify_tls, timeout=timeout) as peer:
-        return peer.info()
-
-
-def preview_bundle(
+def send_bundle(
     bundle: ExportBundle,
     *,
-    peer_url: str,
-    token: str | None = None,
+    peer: str,
     verify_tls: bool = True,
     timeout: float = 120.0,
     prune: bool = False,
     include_mailboxes: bool = False,
-) -> ReconcilePlan:
-    """Ask a peer what it *would* change, without writing anything."""
-    with PeerClient(peer_url, token, verify_tls=verify_tls, timeout=timeout) as peer:
-        raw = peer.plan(bundle.model_dump(mode="json"), prune=prune, include_mailboxes=include_mailboxes)
+) -> ReplicateResponse:
+    """Ship ``bundle`` to a peer sidecar, which applies it to its own mailcow."""
+    base_url = normalize_peer_url(peer)
+
+    with PeerClient(base_url, verify_tls=verify_tls, timeout=timeout) as client:
+        raw = client.send(
+            bundle.model_dump(mode="json"), prune=prune, include_mailboxes=include_mailboxes
+        )
 
     try:
-        return ReconcilePlan.model_validate(raw)
+        peer_response = ReplicateResponse.model_validate(raw)
     except Exception as exc:  # noqa: BLE001 - peer contract mismatch
-        raise PeerError(f"unexpected response from peer plan: {exc}", payload=raw) from exc
+        raise PeerError(f"unexpected response from peer: {exc}", payload=raw) from exc
 
-
-def push_bundle(
-    bundle: ExportBundle,
-    *,
-    peer_url: str,
-    token: str | None = None,
-    verify_tls: bool = True,
-    timeout: float = 120.0,
-    prune: bool = False,
-    include_mailboxes: bool = False,
-) -> ReplicateResult:
-    """Send ``bundle`` to a peer sidecar, which applies it to its own mailcow."""
-    with PeerClient(peer_url, token, verify_tls=verify_tls, timeout=timeout) as peer:
-        raw = peer.apply(bundle.model_dump(mode="json"), prune=prune, include_mailboxes=include_mailboxes)
-
-    try:
-        peer_result = ReconcileResult.model_validate(raw)
-    except Exception as exc:  # noqa: BLE001 - peer contract mismatch
-        raise PeerError(f"unexpected response from peer apply: {exc}", payload=raw) from exc
-
-    return ReplicateResult(
-        peer_url=peer_url.rstrip("/"),
-        pushed_at=datetime.now(timezone.utc).isoformat(),
-        mailcow_hostname=bundle.mailcow_hostname,
+    return ReplicateResponse(
+        mode="send",
+        peer=base_url,
         domains=len(bundle.domains),
         mailboxes=len(bundle.mailboxes),
         aliases=len(bundle.aliases),
-        peer_result=peer_result,
+        applied=peer_response.applied,
+        failed=peer_response.failed,
+        errors=peer_response.errors,
     )
