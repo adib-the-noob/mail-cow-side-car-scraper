@@ -8,10 +8,14 @@ without a real mailcow install.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 PUB_A = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA" + "A" * 402  # len 450 -> "2048"
 PUB_B = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA" + "B" * 402
+
+# An existing rw API key in mailcow's `api` table.
+DEFAULT_API_KEY = "AAAAAA-BBBBBB-CCCCCC-DDDDDD-EEEEEE-FFFFFF"
 
 PRIV_A = (
     "-----BEGIN PRIVATE KEY-----\n"
@@ -91,6 +95,35 @@ ALIAS_ROWS = [
     }
 ]
 
+# SMTP relay / transport credentials (mailcow keeps these in the clear).
+RELAYHOST_ROWS = [
+    {
+        "id": 1,
+        "hostname": "relay.example.org:587",
+        "username": "relayuser",
+        "password": "relaypass",
+        "active": 1,
+    }
+]
+
+TRANSPORT_ROWS = [
+    {
+        "id": 1,
+        "destination": "remote.tld",
+        "nexthop": "mx.remote.tld:25",
+        "username": "tuser",
+        "password": "tpass",
+        "is_mx_based": 0,
+        "active": 1,
+    }
+]
+
+# Flat (username, domain) rows from the admin/domain_admins join.
+DOMAIN_ADMIN_ROWS = [
+    {"username": "deptadmin", "active": 1, "domain": "example.org"},
+    {"username": "deptadmin", "active": 1, "domain": None},
+]
+
 
 def main() -> int:
     args = sys.argv[1:]
@@ -113,6 +146,12 @@ def main() -> int:
 
         if "mysql" in args:
             query = args[-1]
+            # A pre-existing rw API key, so the sidecar reuses it instead of
+            # creating one. Set STUB_API_KEY=none to simulate a fresh mailcow.
+            if "FROM `api`" in query:
+                key = os.environ.get("STUB_API_KEY", DEFAULT_API_KEY)
+                print(json.dumps([] if key == "none" else [{"api_key": key}]))
+                return 0
             if "FROM `domain`" in query:
                 print(json.dumps(DOMAIN_ROWS))
             elif "FROM `alias_domain`" in query:
@@ -131,6 +170,12 @@ def main() -> int:
                 print(json.dumps(MAILBOX_ROWS))
             elif "FROM `alias`" in query:
                 print(json.dumps(ALIAS_ROWS))
+            elif "FROM `relayhosts`" in query:
+                print(json.dumps(RELAYHOST_ROWS))
+            elif "FROM `transports`" in query:
+                print(json.dumps(TRANSPORT_ROWS))
+            elif "FROM `admin`" in query:
+                print(json.dumps(DOMAIN_ADMIN_ROWS))
             else:
                 print("[]")
             return 0

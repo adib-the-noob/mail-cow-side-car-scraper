@@ -132,6 +132,18 @@ class MailcowApiClient:
         data = self._request("GET", "/api/v1/get/alias-domain/all")
         return data if isinstance(data, list) else []
 
+    def list_relayhosts(self) -> list[dict]:
+        data = self._request("GET", "/api/v1/get/relayhost/all")
+        return data if isinstance(data, list) else []
+
+    def list_transports(self) -> list[dict]:
+        data = self._request("GET", "/api/v1/get/transport/all")
+        return data if isinstance(data, list) else []
+
+    def list_domain_admins(self) -> list[dict]:
+        data = self._request("GET", "/api/v1/get/domain-admin/all")
+        return data if isinstance(data, list) else []
+
     # ------------------------------------------------------------------ domain writes
 
     def add_domain(self, attrs: dict) -> Any:
@@ -182,6 +194,34 @@ class MailcowApiClient:
 
     def delete_alias_domain(self, alias_domain: str) -> Any:
         return self._write("/api/v1/delete/alias-domain", [alias_domain])
+
+    # ------------------------------------------------------------------ relayhost writes
+    # mailcow exposes no edit endpoint: a change is delete + add.
+
+    def add_relayhost(self, attrs: dict) -> Any:
+        return self._write("/api/v1/add/relayhost", attrs)
+
+    def delete_relayhost(self, relayhost_id: int) -> Any:
+        return self._write("/api/v1/delete/relayhost", [relayhost_id])
+
+    # ------------------------------------------------------------------ transport writes
+
+    def add_transport(self, attrs: dict) -> Any:
+        return self._write("/api/v1/add/transport", attrs)
+
+    def delete_transport(self, transport_id: int) -> Any:
+        return self._write("/api/v1/delete/transport", [transport_id])
+
+    # ------------------------------------------------------------------ domain admin writes
+
+    def add_domain_admin(self, attrs: dict) -> Any:
+        return self._write("/api/v1/add/domain-admin", attrs)
+
+    def edit_domain_admin(self, username: str, attrs: dict) -> Any:
+        return self._write("/api/v1/edit/domain-admin", {"items": [username], "attr": attrs})
+
+    def delete_domain_admin(self, username: str) -> Any:
+        return self._write("/api/v1/delete/domain-admin", [username])
 
     # ------------------------------------------------------------------ mailbox writes
 

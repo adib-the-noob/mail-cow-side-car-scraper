@@ -11,8 +11,8 @@ from . import __version__
 from .cache import TTLCache
 from .config import MYSQL_SERVICE, REDIS_SERVICE, RSPAMD_SERVICE, PHP_SERVICE, MailcowConfig, SidecarSettings
 from .docker_exec import DockerClient, DockerError
-from .mailcow import MailcowClient
-from .mailcow_api import MailcowApiClient
+from .mailcow import MailcowClient, WriteTargetError
+from .mailcow_api import MailcowApiClient, MailcowApiError
 from .models import (
     AliasDomainInfo,
     AliasInfo,
@@ -25,6 +25,7 @@ from .models import (
     ReplicateResponse,
     ServiceStatus,
     StatusResponse,
+    WriteTargetStatus,
 )
 from .reconcile import apply_plan, build_plan, desired_from_bundle
 from .replicate import PeerError, send_bundle
@@ -107,20 +108,18 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
     def get_client() -> MailcowClient:
         return state.ensure()
 
-    def local_write_client() -> MailcowApiClient:
-        """A client for this node's own mailcow (the write target)."""
-        if not settings.target_url or not settings.target_api_key:
+    def local_write_client(client: MailcowClient) -> MailcowApiClient:
+        """A client for this node's own mailcow (auto-derived when unconfigured)."""
+        try:
+            target = client.resolve_write_target(settings)
+        except WriteTargetError as exc:
             raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=(
-                    "no write target configured on this node; set SIDECAR_TARGET_URL "
-                    "and SIDECAR_TARGET_API_KEY"
-                ),
-            )
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
         return MailcowApiClient(
-            settings.target_url,
-            settings.target_api_key,
-            verify_tls=settings.target_verify_tls,
+            target.url,
+            target.api_key,
+            verify_tls=target.verify_tls,
             timeout=settings.target_timeout,
         )
 
@@ -170,6 +169,11 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
     @app.get("/api/v1/status", response_model=StatusResponse, tags=["meta"])
     def api_status(client: MailcowClient = Depends(get_client)) -> StatusResponse:
         config = client.config
+        try:
+            target = client.resolve_write_target(settings, provision=False)
+            write_target = WriteTargetStatus(url=target.url, source=target.source)
+        except WriteTargetError:
+            write_target = WriteTargetStatus(source="unavailable")
         return StatusResponse(
             version=__version__,
             mailcow_dir=str(config.install_dir),
@@ -178,6 +182,7 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
             split_dkim_255=config.split_dkim_255,
             show_dkim_priv_keys=config.show_dkim_priv_keys,
             services=_service_statuses(client.docker),
+            write_target=write_target,
         )
 
     @app.post("/api/v1/refresh", tags=["meta"])
@@ -294,6 +299,7 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
                     timeout=settings.peer_timeout,
                     prune=request.prune,
                     include_mailboxes=request.include_mailboxes,
+                    include_domain_admins=request.include_domain_admins,
                 )
             except PeerError as exc:
                 raise HTTPException(
@@ -308,7 +314,7 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
             )
 
         desired = desired_from_bundle(request.bundle)
-        api = local_write_client()
+        api = local_write_client(client)
         try:
             plan = build_plan(
                 api,
@@ -317,8 +323,14 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
                 source="bundle",
                 prune=request.prune,
                 include_mailboxes=request.include_mailboxes,
+                include_domain_admins=request.include_domain_admins,
             )
             result = apply_plan(api, plan, desired)
+        except MailcowApiError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"write target unreachable: {exc}",
+            ) from exc
         finally:
             api.close()
 

@@ -28,18 +28,21 @@ from typing import Any, Callable
 
 from .config import MailcowConfig, SidecarSettings
 from .docker_exec import DockerClient
-from .mailcow import MailcowClient
+from .mailcow import MailcowClient, WriteTargetError
 from .mailcow_api import MailcowApiClient, MailcowApiError
 from .models import (
     AliasDomainInfo,
     AliasInfo,
     DkimKey,
+    DomainAdminInfo,
     DomainInfo,
     ExportBundle,
     MailboxInfo,
     ReconcileAction,
     ReconcilePlan,
     ReconcileResult,
+    RelayhostInfo,
+    TransportInfo,
 )
 from .service import export_bundle
 
@@ -67,6 +70,9 @@ class DesiredState:
     aliases: dict[str, dict] = field(default_factory=dict)
     alias_domains: dict[str, dict] = field(default_factory=dict)
     mailboxes: dict[str, dict] = field(default_factory=dict)
+    relayhosts: dict[str, dict] = field(default_factory=dict)
+    transports: dict[str, dict] = field(default_factory=dict)
+    domain_admins: dict[str, dict] = field(default_factory=dict)
 
 
 def desired_from_bundle(bundle: ExportBundle) -> DesiredState:
@@ -123,6 +129,33 @@ def desired_from_bundle(bundle: ExportBundle) -> DesiredState:
                 "active": mailbox.active,
             }
             for mailbox in bundle.mailboxes
+        },
+        relayhosts={
+            relayhost.hostname: {
+                "hostname": relayhost.hostname,
+                "username": relayhost.username or "",
+                "password": relayhost.password or "",
+                "active": relayhost.active,
+            }
+            for relayhost in bundle.relayhosts
+        },
+        transports={
+            transport.destination: {
+                "destination": transport.destination,
+                "nexthop": transport.nexthop,
+                "username": transport.username or "",
+                "password": transport.password or "",
+                "active": transport.active,
+            }
+            for transport in bundle.transports
+        },
+        domain_admins={
+            admin.username: {
+                "username": admin.username,
+                "domains": sorted(admin.domains),
+                "active": admin.active,
+            }
+            for admin in bundle.domain_admins
         },
     )
 
@@ -192,6 +225,7 @@ def build_plan(
     source: str,
     prune: bool = False,
     include_mailboxes: bool = False,
+    include_domain_admins: bool = False,
 ) -> ReconcilePlan:
     actions: list[ReconcileAction] = []
 
@@ -350,6 +384,117 @@ def build_plan(
                     )
                 )
 
+    # ---- relayhosts (SMTP relay credentials; stored in the clear by mailcow)
+    actual_relayhosts = {
+        r.get("hostname"): r for r in api.list_relayhosts() if r.get("hostname")
+    }
+    for hostname, attrs in sorted(desired.relayhosts.items()):
+        add_payload = {
+            "hostname": hostname,
+            "username": attrs.get("username") or "",
+            "password": attrs.get("password") or "",
+        }
+        actual = actual_relayhosts.get(hostname)
+        if actual is None:
+            actions.append(
+                ReconcileAction(
+                    kind="relayhost",
+                    action="create",
+                    target=hostname,
+                    detail="relayhost missing on target",
+                    payload={"add": add_payload},
+                )
+            )
+        elif str(actual.get("username") or "") != add_payload["username"] or str(
+            actual.get("password") or ""
+        ) != add_payload["password"]:
+            actions.append(
+                ReconcileAction(
+                    kind="relayhost",
+                    action="update",
+                    target=hostname,
+                    detail="credentials differ (no edit endpoint: delete + re-add)",
+                    payload={"id": actual.get("id"), "add": add_payload},
+                )
+            )
+
+    # ---- transports (sender-dependent relay credentials)
+    actual_transports = {
+        t.get("destination"): t for t in api.list_transports() if t.get("destination")
+    }
+    for destination, attrs in sorted(desired.transports.items()):
+        add_payload = {
+            "destination": destination,
+            "nexthop": attrs.get("nexthop") or "",
+            "username": attrs.get("username") or "",
+            "password": attrs.get("password") or "",
+            "active": int(bool(attrs.get("active", True))),
+        }
+        actual = actual_transports.get(destination)
+        if actual is None:
+            actions.append(
+                ReconcileAction(
+                    kind="transport",
+                    action="create",
+                    target=destination,
+                    detail="transport missing on target",
+                    payload={"add": add_payload},
+                )
+            )
+        else:
+            differs = (
+                str(actual.get("nexthop") or "") != add_payload["nexthop"]
+                or str(actual.get("username") or "") != add_payload["username"]
+                or str(actual.get("password") or "") != add_payload["password"]
+            )
+            if differs:
+                actions.append(
+                    ReconcileAction(
+                        kind="transport",
+                        action="update",
+                        target=destination,
+                        detail="credentials differ (no edit endpoint: delete + re-add)",
+                        payload={"id": actual.get("id"), "add": add_payload},
+                    )
+                )
+
+    # ---- domain admins (opt-in; the account is recreated, not its password)
+    actual_admins: dict[str, dict] = {}
+    if include_domain_admins:
+        actual_admins = {
+            a.get("username"): a for a in api.list_domain_admins() if a.get("username")
+        }
+        for username, attrs in sorted(desired.domain_admins.items()):
+            domains = sorted(attrs.get("domains") or [])
+            active = int(bool(attrs.get("active", True)))
+            actual = actual_admins.get(username)
+            if actual is None:
+                actions.append(
+                    ReconcileAction(
+                        kind="domain-admin",
+                        action="create",
+                        target=username,
+                        detail="create with random password (original is unreadable)",
+                        payload={
+                            "username": username,
+                            "domains": ",".join(domains),
+                            "active": active,
+                        },
+                    )
+                )
+            elif sorted(actual.get("selected_domains") or []) != domains or int(
+                actual.get("active", 1)
+            ) != active:
+                actions.append(
+                    ReconcileAction(
+                        kind="domain-admin",
+                        action="update",
+                        target=username,
+                        detail="domain grants/state differ",
+                        payload={"active": active, "domains": domains},
+                    )
+                )
+
     # ---- pruning (opt-in, conservative)
     if prune:
         for domain in sorted(set(actual_domains) - set(desired.domains)):
@@ -382,6 +527,40 @@ def build_plan(
                 actions.append(
                     ReconcileAction(
                         kind="mailbox", action="delete", target=username, detail="not in desired state"
+                    )
+                )
+        for hostname, actual in sorted(actual_relayhosts.items()):
+            if hostname in desired.relayhosts:
+                continue
+            actions.append(
+                ReconcileAction(
+                    kind="relayhost",
+                    action="delete",
+                    target=hostname,
+                    detail="not in desired state",
+                    payload={"id": actual.get("id")},
+                )
+            )
+        for destination, actual in sorted(actual_transports.items()):
+            if destination in desired.transports:
+                continue
+            actions.append(
+                ReconcileAction(
+                    kind="transport",
+                    action="delete",
+                    target=destination,
+                    detail="not in desired state",
+                    payload={"id": actual.get("id")},
+                )
+            )
+        if include_domain_admins:
+            for username in sorted(set(actual_admins) - set(desired.domain_admins)):
+                actions.append(
+                    ReconcileAction(
+                        kind="domain-admin",
+                        action="delete",
+                        target=username,
+                        detail="not in desired state",
                     )
                 )
 
@@ -449,6 +628,39 @@ def _dispatch(api: MailcowApiClient, action: ReconcileAction, desired: DesiredSt
         elif action.action == "delete":
             api.delete_mailbox(action.target)
 
+    elif action.kind == "relayhost":
+        if action.action == "create":
+            api.add_relayhost(payload["add"])
+        elif action.action == "update":
+            # No edit endpoint in mailcow: replace it.
+            if payload.get("id") is not None:
+                api.delete_relayhost(int(payload["id"]))
+            api.add_relayhost(payload["add"])
+        elif action.action == "delete":
+            if payload.get("id") is not None:
+                api.delete_relayhost(int(payload["id"]))
+
+    elif action.kind == "transport":
+        if action.action == "create":
+            api.add_transport(payload["add"])
+        elif action.action == "update":
+            if payload.get("id") is not None:
+                api.delete_transport(int(payload["id"]))
+            api.add_transport(payload["add"])
+        elif action.action == "delete":
+            if payload.get("id") is not None:
+                api.delete_transport(int(payload["id"]))
+
+    elif action.kind == "domain-admin":
+        if action.action == "create":
+            password = secrets.token_urlsafe(20)
+            body = dict(payload, password=password, password2=password)
+            api.add_domain_admin(body)
+        elif action.action == "update":
+            api.edit_domain_admin(action.target, payload)
+        elif action.action == "delete":
+            api.delete_domain_admin(action.target)
+
 
 def apply_plan(
     api: MailcowApiClient, plan: ReconcilePlan, desired: DesiredState
@@ -469,7 +681,7 @@ def apply_plan(
 # ---------------------------------------------------------------------- CLI
 
 
-def _local_desired(settings: SidecarSettings) -> DesiredState:
+def _local_client(settings: SidecarSettings) -> MailcowClient:
     config = MailcowConfig.load(settings)
     docker = DockerClient(
         binary=settings.docker_bin,
@@ -477,7 +689,7 @@ def _local_desired(settings: SidecarSettings) -> DesiredState:
         timeout=settings.request_timeout,
         cache_ttl=settings.cache_ttl,
     )
-    return desired_from_local(MailcowClient(config, docker, cache=_NoCache()))
+    return MailcowClient(config, docker, cache=_NoCache())
 
 
 class _NoCache:
@@ -499,18 +711,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", choices=["local", "bundle"], default="local")
     parser.add_argument("--bundle", help="ExportBundle JSON file (with --source bundle)")
     parser.add_argument("--include-mailboxes", action="store_true")
+    parser.add_argument("--include-domain-admins", action="store_true")
     parser.add_argument("--prune", action="store_true", help="delete objects absent from desired state")
     parser.add_argument("--apply", action="store_true", help="execute (default is dry-run)")
     parser.add_argument("--insecure", action="store_true", help="skip TLS verification")
     args = parser.parse_args(argv)
 
     settings = SidecarSettings.from_env()
-    target_url = args.target_url or settings.target_url
-    if not target_url:
-        parser.error("no target URL: pass --target-url or set SIDECAR_TARGET_URL")
-    api_key = args.target_api_key or settings.target_api_key
-    if not api_key:
-        parser.error("no API key: pass --target-api-key or set SIDECAR_TARGET_API_KEY")
+    local = _local_client(settings)
 
     if args.source == "bundle":
         if not args.bundle:
@@ -518,10 +726,23 @@ def main(argv: list[str] | None = None) -> int:
         bundle = ExportBundle.model_validate(json.loads(open(args.bundle).read()))
         desired = desired_from_bundle(bundle)
     else:
-        desired = _local_desired(settings)
+        desired = desired_from_local(local)
+
+    # Explicit target wins; otherwise derive this node's own mailcow target.
+    target_url = args.target_url or settings.target_url
+    api_key = args.target_api_key or settings.target_api_key
+    verify_tls = not args.insecure
+    if not (target_url and api_key):
+        try:
+            resolved = local.resolve_write_target(settings)
+        except WriteTargetError as exc:
+            parser.error(str(exc))
+        target_url, api_key = resolved.url, resolved.api_key
+        if not args.insecure:
+            verify_tls = resolved.verify_tls
 
     with MailcowApiClient(
-        target_url, api_key, verify_tls=not args.insecure, timeout=settings.target_timeout
+        target_url, api_key, verify_tls=verify_tls, timeout=settings.target_timeout
     ) as api:
         plan = build_plan(
             api,
@@ -530,6 +751,7 @@ def main(argv: list[str] | None = None) -> int:
             source=args.source,
             prune=args.prune,
             include_mailboxes=args.include_mailboxes,
+            include_domain_admins=args.include_domain_admins,
         )
         print(json.dumps(plan.model_dump(), indent=2))
         if not args.apply:

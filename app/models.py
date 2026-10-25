@@ -81,6 +81,16 @@ class ServiceStatus(BaseModel):
     error: str | None = None
 
 
+class WriteTargetStatus(BaseModel):
+    url: str | None = None
+    source: str | None = Field(
+        default=None,
+        description=(
+            "configured | existing-key | created-key | auto-create | unavailable"
+        ),
+    )
+
+
 class StatusResponse(BaseModel):
     version: str
     mailcow_dir: str
@@ -89,6 +99,39 @@ class StatusResponse(BaseModel):
     split_dkim_255: bool
     show_dkim_priv_keys: bool
     services: list[ServiceStatus]
+    write_target: WriteTargetStatus | None = None
+
+
+class RelayhostInfo(BaseModel):
+    """SMTP relay credentials. mailcow stores the password in the clear, so it
+    round-trips exactly (a literal ``:`` is escaped by mailcow on write)."""
+
+    hostname: str = Field(description="host:port, e.g. mail.relay.tld:587")
+    username: str | None = None
+    password: str | None = None
+    active: bool = True
+    id: int | None = None
+
+
+class TransportInfo(BaseModel):
+    """Sender-dependent transport credentials (also stored in the clear)."""
+
+    destination: str
+    nexthop: str
+    username: str | None = None
+    password: str | None = None
+    is_mx_based: bool = False
+    active: bool = True
+    id: int | None = None
+
+
+class DomainAdminInfo(BaseModel):
+    """A domain-admin *account*. Its password is hashed and never readable, so
+    the account can be recreated but not with the original password."""
+
+    username: str
+    domains: list[str] = Field(default_factory=list)
+    active: bool = True
 
 
 class ExportBundle(BaseModel):
@@ -100,9 +143,14 @@ class ExportBundle(BaseModel):
     alias_domains: list[AliasDomainInfo]
     mailboxes: list[MailboxInfo] = Field(default_factory=list)
     aliases: list[AliasInfo] = Field(default_factory=list)
+    relayhosts: list[RelayhostInfo] = Field(default_factory=list)
+    transports: list[TransportInfo] = Field(default_factory=list)
+    domain_admins: list[DomainAdminInfo] = Field(default_factory=list)
 
 
-ActionKind = Literal["domain", "dkim", "alias", "alias-domain", "mailbox"]
+ActionKind = Literal[
+    "domain", "dkim", "alias", "alias-domain", "mailbox", "relayhost", "transport", "domain-admin"
+]
 ActionType = Literal["create", "update", "delete", "import-dkim"]
 
 
@@ -154,7 +202,12 @@ class ReplicateRequest(BaseModel):
     )
     prune: bool = Field(default=False, description="Also delete what is absent from the source")
     include_mailboxes: bool = Field(
-        default=False, description="Include mailboxes (random password + force_pw_update)"
+        default=False,
+        description="Include mailboxes (account only; random password + force_pw_update)",
+    )
+    include_domain_admins: bool = Field(
+        default=False,
+        description="Include domain-admin accounts (random password; the original is unreadable)",
     )
 
 

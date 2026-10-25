@@ -10,10 +10,13 @@ from .models import (
     AliasDomainInfo,
     AliasInfo,
     DkimKey,
+    DomainAdminInfo,
     DomainInfo,
     DnsRecord,
     ExportBundle,
     MailboxInfo,
+    RelayhostInfo,
+    TransportInfo,
 )
 
 
@@ -198,6 +201,53 @@ def domain_bundle(client: MailcowClient, domain: str) -> DomainInfo | None:
     return None
 
 
+def collect_relayhosts(client: MailcowClient) -> list[RelayhostInfo]:
+    return [
+        RelayhostInfo(
+            hostname=row["hostname"],
+            username=row.get("username"),
+            password=row.get("password"),
+            active=_to_bool(row.get("active"), True),
+            id=_to_int(row.get("id")),
+        )
+        for row in client.relayhosts()
+    ]
+
+
+def collect_transports(client: MailcowClient) -> list[TransportInfo]:
+    return [
+        TransportInfo(
+            destination=row["destination"],
+            nexthop=row["nexthop"],
+            username=row.get("username"),
+            password=row.get("password"),
+            is_mx_based=_to_bool(row.get("is_mx_based")),
+            active=_to_bool(row.get("active"), True),
+            id=_to_int(row.get("id")),
+        )
+        for row in client.transports()
+    ]
+
+
+def collect_domain_admins(client: MailcowClient) -> list[DomainAdminInfo]:
+    """Group the flat (username, domain) rows coming out of the admin/domain_admins join."""
+    grouped: dict[str, dict] = {}
+    for row in client.domain_admins():
+        username = row.get("username")
+        if not username:
+            continue
+        entry = grouped.setdefault(
+            username,
+            {"username": username, "active": _to_bool(row.get("active"), True), "domains": set()},
+        )
+        if row.get("domain"):
+            entry["domains"].add(row["domain"])
+    return [
+        DomainAdminInfo(username=entry["username"], active=entry["active"], domains=sorted(entry["domains"]))
+        for entry in sorted(grouped.values(), key=lambda e: e["username"])
+    ]
+
+
 def export_bundle(client: MailcowClient) -> ExportBundle:
     return ExportBundle(
         generated_at=datetime.now(timezone.utc).isoformat(),
@@ -206,4 +256,7 @@ def export_bundle(client: MailcowClient) -> ExportBundle:
         alias_domains=collect_alias_domains(client),
         mailboxes=collect_mailboxes(client),
         aliases=collect_aliases(client),
+        relayhosts=collect_relayhosts(client),
+        transports=collect_transports(client),
+        domain_admins=collect_domain_admins(client),
     )

@@ -84,8 +84,20 @@ class PeerClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def send(self, bundle: dict, *, prune: bool = False, include_mailboxes: bool = False) -> dict:
-        body = {"bundle": bundle, "prune": prune, "include_mailboxes": include_mailboxes}
+    def send(
+        self,
+        bundle: dict,
+        *,
+        prune: bool = False,
+        include_mailboxes: bool = False,
+        include_domain_admins: bool = False,
+    ) -> dict:
+        body = {
+            "bundle": bundle,
+            "prune": prune,
+            "include_mailboxes": include_mailboxes,
+            "include_domain_admins": include_domain_admins,
+        }
         try:
             response = self._client.post("/api/v1/replicate", json=body)
         except httpx.HTTPError as exc:
@@ -116,13 +128,17 @@ def send_bundle(
     timeout: float = 120.0,
     prune: bool = False,
     include_mailboxes: bool = False,
+    include_domain_admins: bool = False,
 ) -> ReplicateResponse:
     """Ship ``bundle`` to a peer sidecar, which applies it to its own mailcow."""
     base_url = normalize_peer_url(peer)
 
     with PeerClient(base_url, verify_tls=verify_tls, timeout=timeout) as client:
         raw = client.send(
-            bundle.model_dump(mode="json"), prune=prune, include_mailboxes=include_mailboxes
+            bundle.model_dump(mode="json"),
+            prune=prune,
+            include_mailboxes=include_mailboxes,
+            include_domain_admins=include_domain_admins,
         )
 
     try:

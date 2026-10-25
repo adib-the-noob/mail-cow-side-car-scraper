@@ -14,9 +14,12 @@ process list.
 from __future__ import annotations
 
 import json
+import secrets
+import threading
+from dataclasses import dataclass
 
 from .cache import TTLCache
-from .config import MYSQL_SERVICE, REDIS_SERVICE, MailcowConfig
+from .config import MYSQL_SERVICE, REDIS_SERVICE, MailcowConfig, SidecarSettings
 from .docker_exec import DockerClient, DockerError
 from .dkim import build_dkim_txt, infer_key_length
 from .models import DkimKey
@@ -62,6 +65,20 @@ MAILBOX_COLUMNS = (
 )
 ALIAS_COLUMNS = ("id", "address", "goto", "domain", "active")
 ALIAS_DOMAIN_COLUMNS = ("alias_domain", "target_domain", "active")
+# mailcow stores these two passwords in the clear (relayhost/transport maps use
+# ':' as the field separator, so a literal ':' is backslash-escaped on write).
+RELAYHOST_COLUMNS = ("id", "hostname", "username", "password", "active")
+TRANSPORT_COLUMNS = ("id", "destination", "nexthop", "username", "password", "is_mx_based", "active")
+
+# Domain admins live in `admin` with superadmin = 0; their per-domain grants are
+# in `domain_admins`. One flat row per (user, domain); grouped in Python.
+_DOMAIN_ADMINS_QUERY = (
+    "SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT("
+    "'username', a.`username`, 'active', a.`active`, 'domain', d.`domain`"
+    ")), JSON_ARRAY()) FROM `admin` AS a "
+    "LEFT JOIN `domain_admins` AS d ON d.`username` = a.`username` "
+    "WHERE a.`superadmin` = 0"
+)
 
 
 def _json_array_query(table: str, columns: tuple[str, ...]) -> str:
@@ -72,11 +89,26 @@ def _json_array_query(table: str, columns: tuple[str, ...]) -> str:
     )
 
 
+class WriteTargetError(RuntimeError):
+    """No usable write target could be resolved for this node's own mailcow."""
+
+
+@dataclass
+class WriteTarget:
+    """How to reach *this* node's own mailcow for writes."""
+
+    url: str
+    api_key: str
+    verify_tls: bool
+    source: str  # "configured" | "existing-key" | "created-key"
+
+
 class MailcowClient:
     def __init__(self, config: MailcowConfig, docker: DockerClient, cache: TTLCache) -> None:
         self.config = config
         self.docker = docker
         self.cache = cache
+        self._key_lock = threading.Lock()
 
     # ------------------------------------------------------------------ low level
 
@@ -177,5 +209,101 @@ class MailcowClient:
             "aliases", lambda: self._query(_json_array_query("alias", ALIAS_COLUMNS))
         )
 
+    def relayhosts(self) -> list[dict]:
+        return self.cache.get_or_set(
+            "relayhosts", lambda: self._query(_json_array_query("relayhosts", RELAYHOST_COLUMNS))
+        )
+
+    def transports(self) -> list[dict]:
+        return self.cache.get_or_set(
+            "transports", lambda: self._query(_json_array_query("transports", TRANSPORT_COLUMNS))
+        )
+
+    def domain_admins(self) -> list[dict]:
+        return self.cache.get_or_set(
+            "domain_admins", lambda: self._query(_DOMAIN_ADMINS_QUERY)
+        )
+
     def invalidate_cache(self) -> None:
         self.cache.invalidate()
+
+    # ------------------------------------------------------------------ write target
+
+    def _execute(self, query: str) -> None:
+        """Run a statement (no result expected)."""
+        self.docker.exec(
+            MYSQL_SERVICE,
+            [
+                "mysql",
+                "--batch",
+                f"--user={self.config.dbuser}",
+                f"--database={self.config.dbname}",
+                "-e",
+                query,
+            ],
+            env={"MYSQL_PWD": self.config.dbpass},
+        )
+
+    def find_rw_api_key(self) -> str | None:
+        """Reuse an active read-write API key that already exists in mailcow."""
+        rows = self._query(
+            "SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('api_key', `api_key`)), JSON_ARRAY()) "
+            "FROM `api` WHERE `access` = 'rw' AND `active` = 1"
+        )
+        for row in rows:
+            if row.get("api_key"):
+                return str(row["api_key"])
+        return None
+
+    def provision_api_key(self) -> str:
+        """Create an rw API key for this sidecar (exactly what the UI does).
+
+        ``skip_ip_check`` is set because the sidecar reaches mailcow from the
+        Docker bridge, whose source IP is not stable.
+        """
+        key = "-".join(secrets.token_hex(3).upper() for _ in range(6))
+        self._execute(
+            "INSERT INTO `api` (`api_key`, `allow_from`, `skip_ip_check`, `access`, `active`) "
+            f"VALUES ('{key}', '', 1, 'rw', 1)"
+        )
+        return key
+
+    def resolve_write_target(
+        self, settings: SidecarSettings, *, provision: bool = True
+    ) -> WriteTarget:
+        """Resolve how to write to *this* node's own mailcow.
+
+        Explicit ``SIDECAR_TARGET_*`` wins. Otherwise the URL is derived from
+        ``mailcow.conf`` (loopback) and the key is an existing rw key, or one we
+        create — so a fresh node needs no configuration at all.
+
+        ``provision=False`` reports what *would* happen without creating a key.
+        """
+        if settings.target_url and settings.target_api_key:
+            return WriteTarget(
+                settings.target_url,
+                settings.target_api_key,
+                settings.target_verify_tls,
+                "configured",
+            )
+
+        url = settings.target_url or f"https://127.0.0.1:{self.config.https_port}"
+        # A loopback target cannot validate mailcow's cert (issued for MAILCOW_HOSTNAME).
+        verify_tls = settings.target_verify_tls if settings.target_url else False
+
+        if settings.target_api_key:
+            return WriteTarget(url, settings.target_api_key, verify_tls, "configured")
+
+        with self._key_lock:
+            key = self.find_rw_api_key()
+            if key:
+                return WriteTarget(url, key, verify_tls, "existing-key")
+            if settings.auto_api_key:
+                if not provision:
+                    return WriteTarget(url, "", verify_tls, "auto-create")
+                return WriteTarget(url, self.provision_api_key(), verify_tls, "created-key")
+
+        raise WriteTargetError(
+            "no write target: set SIDECAR_TARGET_API_KEY, create an rw API key in the "
+            "mailcow UI, or enable SIDECAR_AUTO_API_KEY to let the sidecar create one"
+        )

@@ -60,10 +60,11 @@ All settings are environment variables (also read from `.env`):
 | `SIDECAR_DOCKER_BIN` | `docker` | Docker CLI binary. |
 | `SIDECAR_REQUEST_TIMEOUT` | `30` | Seconds per `docker exec`. |
 | `SIDECAR_CACHE_TTL` | `30` | Seconds to cache scraped data (`0` disables). |
-| `SIDECAR_TARGET_URL` | *(empty)* | Reconciler target, e.g. `https://mail.example.org`. Enables the write endpoints. |
-| `SIDECAR_TARGET_API_KEY` | *(empty)* | **`rw`** API key on the target. |
-| `SIDECAR_TARGET_VERIFY_TLS` | `true` | Set `false` for self-signed certs on the target. |
+| `SIDECAR_TARGET_URL` | *auto* | Override the write target. Defaults to this node's own mailcow (`https://127.0.0.1:<HTTPS_PORT>`). |
+| `SIDECAR_TARGET_API_KEY` | *auto* | Override the `rw` API key. Defaults to an existing key, or one the sidecar creates. |
+| `SIDECAR_TARGET_VERIFY_TLS` | `true` | TLS verification for an explicit `SIDECAR_TARGET_URL`. A derived loopback target always skips it. |
 | `SIDECAR_TARGET_TIMEOUT` | `30` | Seconds for target API calls. |
+| `SIDECAR_AUTO_API_KEY` | `true` | Create an `rw` API key in this node's mailcow when none exists (zero-config receive). |
 | `SIDECAR_PEER_VERIFY_TLS` | `true` | Verify TLS when talking to a peer sidecar. |
 | `SIDECAR_PEER_TIMEOUT` | `120` | Seconds for peer push calls. |
 
@@ -106,7 +107,7 @@ reach the port. Keep it bound to localhost (the default) or firewall it.
 | GET | `/api/v1/dns/{domain}` | DNS records for one domain. |
 | GET | `/api/v1/mailboxes?domain=` | Mailboxes. |
 | GET | `/api/v1/aliases?domain=` | Aliases. |
-| GET | `/api/v1/export` | Everything in one bundle (domains, DKIM, DNS, mailboxes, aliases). |
+| GET | `/api/v1/export` | Everything in one bundle (domains, DKIM, DNS, mailboxes, aliases, relayhosts, transports, domain admins). |
 | POST | `/api/v1/replicate` | Push to a peer (`{"peer": "10.0.0.2"}`) or apply a bundle locally (`{"bundle": {...}}`). |
 
 Examples:
@@ -152,53 +153,81 @@ One route, two directions. Run this sidecar on **both** nodes.
 `peer` takes a bare IP/host (`10.0.0.2`, `10.0.0.2:9000` — `http://` and port
 `8800` are assumed) or a full URL like `https://mail.example.org`.
 
-### One-time setup on Node 2 (the empty instance)
+### Node 2 (the empty instance) — zero config
 
 1. Install mailcow + this sidecar and let it come up.
-2. In Node 2's mailcow UI create an API key with **read-write** access
-   (`Configuration → Access → Edit administrator details → API`). Set
-   `allow_from` to the sidecar host's source IP, or tick *skip IP check*.
-3. Point Node 2's sidecar at its own mailcow:
+2. That's it — **no configuration needed**.
 
-   ```ini
-   SIDECAR_TARGET_URL=https://127.0.0.1      # or the mailcow hostname
-   SIDECAR_TARGET_API_KEY=<the rw key>
-   SIDECAR_TARGET_VERIFY_TLS=false           # if using a self-signed cert
-   ```
+Node 2 resolves its own write target automatically: it derives the URL from
+`mailcow.conf` (`https://127.0.0.1:<HTTPS_PORT>`, TLS verification off since the
+cert is issued for `MAILCOW_HOSTNAME`), reuses any active `rw` API key already in
+mailcow, and — if there is none — creates one for itself
+(`SIDECAR_AUTO_API_KEY=true`, the default). Check what it settled on:
 
-Node 1 needs no target — it only scrapes and sends.
+```bash
+curl -s http://127.0.0.1:8800/api/v1/status | jq .write_target
+# {"url": "https://127.0.0.1:443", "source": "existing-key"}
+```
+
+`source` is `configured | existing-key | created-key | auto-create | unavailable`.
+Set `SIDECAR_AUTO_API_KEY=false` if you'd rather create the key yourself; then you
+must also set `SIDECAR_TARGET_API_KEY`. Node 1 never needs any of this — it only
+scrapes and sends.
 
 ### Push from Node 1
 
 ```bash
 curl -s -X POST http://127.0.0.1:8800/api/v1/replicate \
   -H 'Content-Type: application/json' \
-  -d '{"peer": "10.0.0.2", "include_mailboxes": true}' | jq
+  -d '{"peer": "10.0.0.2", "include_mailboxes": true, "include_domain_admins": true}' | jq
 ```
 
 ```json
 {"mode": "send", "peer": "http://10.0.0.2:8800",
- "domains": 2, "mailboxes": 1, "aliases": 1, "applied": 6, "failed": 0, "errors": []}
+ "domains": 2, "mailboxes": 1, "aliases": 1, "applied": 9, "failed": 0, "errors": []}
 ```
 
 `domains`/`mailboxes`/`aliases` are what Node 1 sent; `applied`/`failed`/`errors`
 are what Node 2 did.
 
+### What gets replicated
+
+| Replicated | Fidelity |
+| --- | --- |
+| domains, alias domains, aliases | exactly |
+| DKIM keys | **private keys imported**, so both nodes sign identically |
+| relayhosts, transports | **real SMTP credentials** (mailcow keeps these in the clear) |
+| mailboxes | account/quota/active only — **new random password** + `force_pw_update` |
+| domain admins | account + domain grants only — **new random password** |
+
+Mailboxes and domain admins are opt-in (`include_mailboxes` /
+`include_domain_admins`), because mailcow stores their passwords as one-way
+hashes that no API can read back.
+
+**Not replicable through the mailcow API at all** — these would need a raw DB
+copy, which is what mailcow's own `backup_and_restore.sh` / cold-standby already
+do:
+
+- the main `admin` account (no API to create one; password is hashed)
+- mailbox, app-password and sync-job passwords (hashed, or never returned)
+- API keys (no create endpoint)
+- TFA secrets (device-bound — copying them would break logins)
+- OAuth2 client secrets (`add/oauth2-client` regenerates the secret)
+- mail, sieve filters, SOGo data, quarantine → volume data, not config
+
 ### Notes
 
 - **Ordering is handled**: domains are created before DKIM imports, alias
-  domains, aliases and mailboxes, so a fresh node provisions cleanly.
+  domains, aliases, mailboxes and domain admins.
 - **Idempotent**: the receiver diffs against its own state first, so re-pushing
   is a no-op and a half-finished push can safely be repeated.
 - **`prune: true` is the only destructive option** — it deletes on the peer
   whatever is absent locally. Leave it off until you trust the sync.
-- **The wire carries DKIM private keys** (that's how both nodes sign
-  identically). Use HTTPS or an SSH tunnel — there is no authentication on this
-  endpoint, so never expose it to the internet.
+- **The wire carries DKIM private keys and SMTP credentials.** Use HTTPS or an
+  SSH tunnel — there is no authentication on this endpoint, so never expose it to
+  the internet.
 - **Configuration only** — Node 2 gets no mail. Copy `vmail-vol-1` separately if
   you want the actual messages.
-- **Mailbox passwords cannot be synced** (mailcow stores only a hash); created
-  mailboxes get a random password plus `force_pw_update=1`.
 - **DNS targets are per-node** — MX/autodiscover/SRV point at each node's own
   `MAILCOW_HOSTNAME`.
 - **mailcow is single-master** — for host-level HA use mailcow's cold-standby
@@ -206,12 +235,16 @@ are what Node 2 did.
 
 ### CLI (optional, no HTTP needed)
 
-Node 1 can also write straight to Node 2's mailcow API, skipping Node 2's sidecar:
+Node 1 can also write straight into a target's mailcow, skipping its sidecar. With
+no `--target-*` it resolves the local node's own target, same as the API:
 
 ```bash
+python -m app.reconcile --source local --apply          # local mailcow
 python -m app.reconcile --target-url https://mail.example.org \
-  --target-api-key <node2 rw key> --insecure --apply
+  --target-api-key <rw key> --apply                     # a remote node
 ```
+
+Add `--include-mailboxes` / `--include-domain-admins` / `--prune` as needed.
 
 `deploy/mailcow-reconcile.service` + `.timer` run that every 15 minutes.
 

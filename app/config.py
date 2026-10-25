@@ -93,6 +93,9 @@ class SidecarSettings:
     target_api_key: str | None = None
     target_verify_tls: bool = True
     target_timeout: float = 30.0
+    # When no target is configured, derive it from mailcow.conf and reuse (or
+    # create) an rw API key in this node's own mailcow.
+    auto_api_key: bool = True
     # Replication peer defaults (a peer is another sidecar).
     peer_verify_tls: bool = True
     peer_timeout: float = 120.0
@@ -112,6 +115,7 @@ class SidecarSettings:
             target_api_key=env.get("SIDECAR_TARGET_API_KEY") or None,
             target_verify_tls=_as_bool(env.get("SIDECAR_TARGET_VERIFY_TLS"), True),
             target_timeout=float(env.get("SIDECAR_TARGET_TIMEOUT", "30")),
+            auto_api_key=_as_bool(env.get("SIDECAR_AUTO_API_KEY"), True),
             peer_verify_tls=_as_bool(env.get("SIDECAR_PEER_VERIFY_TLS"), True),
             peer_timeout=float(env.get("SIDECAR_PEER_TIMEOUT", "120")),
         )
