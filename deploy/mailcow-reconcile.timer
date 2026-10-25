@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the mailcow config reconciler periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=mailcow-reconcile.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

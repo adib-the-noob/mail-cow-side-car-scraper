@@ -82,11 +82,37 @@ def collect_domains(client: MailcowClient, *, include_dns: bool = True) -> list[
     dkim_map = client.dkim_keys()
     alias_domains = _alias_domain_set(client)
     rows = client.domains()
-    infos = [
-        build_domain_info(client, row, dkim_map, alias_domains, include_dns=include_dns)
-        for row in rows
-    ]
-    return sorted(infos, key=lambda info: info.domain)
+
+    by_name: dict[str, DomainInfo] = {}
+    for row in rows:
+        info = build_domain_info(client, row, dkim_map, alias_domains, include_dns=include_dns)
+        by_name[info.domain] = info
+
+    # Alias domains live in their own table but still need MX/DKIM records.
+    for row in client.alias_domains():
+        name = row.get("alias_domain")
+        if not name:
+            continue
+        if name in by_name:
+            by_name[name].is_alias_domain = True
+            continue
+        info = DomainInfo(
+            domain=name,
+            is_alias_domain=True,
+            active=_to_bool(row.get("active"), True),
+            dkim=dkim_map.get(name),
+        )
+        if include_dns:
+            info.dns = build_dns_records(
+                name,
+                hostname=client.config.hostname,
+                https_port=client.config.https_port,
+                dkim=info.dkim,
+                is_alias_domain=True,
+            )
+        by_name[name] = info
+
+    return sorted(by_name.values(), key=lambda info: info.domain)
 
 
 def collect_alias_domains(client: MailcowClient) -> list[AliasDomainInfo]:
@@ -178,4 +204,6 @@ def export_bundle(client: MailcowClient) -> ExportBundle:
         mailcow_hostname=client.config.hostname,
         domains=collect_domains(client, include_dns=True),
         alias_domains=collect_alias_domains(client),
+        mailboxes=collect_mailboxes(client),
+        aliases=collect_aliases(client),
     )

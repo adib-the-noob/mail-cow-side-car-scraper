@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -12,6 +13,7 @@ from .cache import TTLCache
 from .config import MYSQL_SERVICE, REDIS_SERVICE, RSPAMD_SERVICE, PHP_SERVICE, MailcowConfig, SidecarSettings
 from .docker_exec import DockerClient, DockerError
 from .mailcow import MailcowClient
+from .mailcow_api import MailcowApiClient
 from .models import (
     AliasDomainInfo,
     AliasInfo,
@@ -20,9 +22,18 @@ from .models import (
     DnsRecord,
     ExportBundle,
     MailboxInfo,
+    PeerInfo,
+    PeerProbeRequest,
+    ReconcilePlan,
+    ReconcileRequest,
+    ReconcileResult,
+    ReplicateRequest,
+    ReplicateResult,
     ServiceStatus,
     StatusResponse,
 )
+from .reconcile import apply_plan, build_plan, desired_from_bundle, desired_from_local
+from .replicate import PeerError, preview_bundle, probe_peer, push_bundle
 from .security import build_auth_dependency
 from .service import (
     collect_alias_domains,
@@ -105,6 +116,32 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
     def get_client() -> MailcowClient:
         return state.ensure()
 
+    def get_target_client() -> Iterator[MailcowApiClient]:
+        """Provide a client for the configured reconciler target, if any."""
+        if not settings.target_url or not settings.target_api_key:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "reconciler target not configured; set SIDECAR_TARGET_URL and "
+                    "SIDECAR_TARGET_API_KEY"
+                ),
+            )
+        api = MailcowApiClient(
+            settings.target_url,
+            settings.target_api_key,
+            verify_tls=settings.target_verify_tls,
+            timeout=settings.target_timeout,
+        )
+        try:
+            yield api
+        finally:
+            api.close()
+
+    def resolve_desired(request: ReconcileRequest, client: MailcowClient) -> tuple[object, str]:
+        if request.bundle is not None:
+            return desired_from_bundle(request.bundle), "bundle"
+        return desired_from_local(client), "local"
+
     # ------------------------------------------------------------------ meta
 
     @app.get("/", tags=["meta"])
@@ -126,6 +163,12 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
                 "/api/v1/aliases",
                 "/api/v1/alias-domains",
                 "/api/v1/export",
+                "/api/v1/reconcile/target",
+                "/api/v1/reconcile/plan",
+                "/api/v1/reconcile/apply",
+                "/api/v1/replicate/peer",
+                "/api/v1/replicate/preview",
+                "/api/v1/replicate/push",
             ],
         }
 
@@ -253,6 +296,127 @@ def create_app(settings: SidecarSettings | None = None) -> FastAPI:
     )
     def export_domain(domain: str, client: MailcowClient = Depends(get_client)) -> DomainInfo:
         return get_domain(domain, client)
+
+    # ------------------------------------------------------------------ reconcile
+
+    @app.get("/api/v1/reconcile/target", dependencies=guarded, tags=["reconcile"])
+    def reconcile_target(api: MailcowApiClient = Depends(get_target_client)) -> dict:
+        return {
+            "url": api.base_url,
+            "verify_tls": settings.target_verify_tls,
+            "reachable": True,
+            "version": api.ping(),
+        }
+
+    @app.post(
+        "/api/v1/reconcile/plan",
+        response_model=ReconcilePlan,
+        dependencies=guarded,
+        tags=["reconcile"],
+    )
+    def reconcile_plan(
+        request: ReconcileRequest,
+        api: MailcowApiClient = Depends(get_target_client),
+        client: MailcowClient = Depends(get_client),
+    ) -> ReconcilePlan:
+        desired, source = resolve_desired(request, client)
+        return build_plan(
+            api,
+            desired,
+            target_url=api.base_url,
+            source=source,
+            prune=request.prune,
+            include_mailboxes=request.include_mailboxes,
+        )
+
+    @app.post(
+        "/api/v1/reconcile/apply",
+        response_model=ReconcileResult,
+        dependencies=guarded,
+        tags=["reconcile"],
+    )
+    def reconcile_apply(
+        request: ReconcileRequest,
+        api: MailcowApiClient = Depends(get_target_client),
+        client: MailcowClient = Depends(get_client),
+    ) -> ReconcileResult:
+        desired, source = resolve_desired(request, client)
+        plan = build_plan(
+            api,
+            desired,
+            target_url=api.base_url,
+            source=source,
+            prune=request.prune,
+            include_mailboxes=request.include_mailboxes,
+        )
+        return apply_plan(api, plan, desired)
+
+    # ------------------------------------------------------------------ replicate
+
+    def resolve_peer_tls(override: bool | None) -> bool:
+        return settings.peer_verify_tls if override is None else override
+
+    @app.post(
+        "/api/v1/replicate/peer",
+        response_model=PeerInfo,
+        dependencies=guarded,
+        tags=["replicate"],
+    )
+    def replicate_probe(request: PeerProbeRequest) -> PeerInfo:
+        return probe_peer(
+            request.peer_url,
+            token=request.peer_token or settings.peer_token,
+            verify_tls=resolve_peer_tls(request.peer_verify_tls),
+            timeout=settings.peer_timeout,
+        )
+
+    @app.post(
+        "/api/v1/replicate/preview",
+        response_model=ReconcilePlan,
+        dependencies=guarded,
+        tags=["replicate"],
+    )
+    def replicate_preview(
+        request: ReplicateRequest,
+        client: MailcowClient = Depends(get_client),
+    ) -> ReconcilePlan:
+        bundle = request.bundle or export_bundle(client)
+        try:
+            return preview_bundle(
+                bundle,
+                peer_url=request.peer_url,
+                token=request.peer_token or settings.peer_token,
+                verify_tls=resolve_peer_tls(request.peer_verify_tls),
+                timeout=settings.peer_timeout,
+                prune=request.prune,
+                include_mailboxes=request.include_mailboxes,
+            )
+        except PeerError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/replicate/push",
+        response_model=ReplicateResult,
+        dependencies=guarded,
+        tags=["replicate"],
+    )
+    def replicate_push(
+        request: ReplicateRequest,
+        client: MailcowClient = Depends(get_client),
+    ) -> ReplicateResult:
+        bundle = request.bundle or export_bundle(client)
+        try:
+            return push_bundle(
+                bundle,
+                peer_url=request.peer_url,
+                token=request.peer_token or settings.peer_token,
+                verify_tls=resolve_peer_tls(request.peer_verify_tls),
+                timeout=settings.peer_timeout,
+                prune=request.prune,
+                include_mailboxes=request.include_mailboxes,
+            )
+        except PeerError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
     return app
 

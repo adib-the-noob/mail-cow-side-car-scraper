@@ -89,6 +89,15 @@ class SidecarSettings:
     cache_ttl: float = 30.0
     mailcow_dir: str | None = None
     compose_project: str | None = None
+    # Reconciler target (another mailcow node). Optional; enables the write side.
+    target_url: str | None = None
+    target_api_key: str | None = None
+    target_verify_tls: bool = True
+    target_timeout: float = 30.0
+    # Replication peer defaults (a peer is another sidecar).
+    peer_token: str | None = None
+    peer_verify_tls: bool = True
+    peer_timeout: float = 120.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SidecarSettings":
@@ -102,6 +111,13 @@ class SidecarSettings:
             cache_ttl=float(env.get("SIDECAR_CACHE_TTL", "30")),
             mailcow_dir=env.get("SIDECAR_MAILCOW_DIR") or env.get("MAILCOW_DIR"),
             compose_project=env.get("SIDECAR_COMPOSE_PROJECT") or env.get("COMPOSE_PROJECT_NAME"),
+            target_url=env.get("SIDECAR_TARGET_URL") or None,
+            target_api_key=env.get("SIDECAR_TARGET_API_KEY") or None,
+            target_verify_tls=_as_bool(env.get("SIDECAR_TARGET_VERIFY_TLS"), True),
+            target_timeout=float(env.get("SIDECAR_TARGET_TIMEOUT", "30")),
+            peer_token=env.get("SIDECAR_PEER_TOKEN") or None,
+            peer_verify_tls=_as_bool(env.get("SIDECAR_PEER_VERIFY_TLS"), True),
+            peer_timeout=float(env.get("SIDECAR_PEER_TIMEOUT", "120")),
         )
 
 

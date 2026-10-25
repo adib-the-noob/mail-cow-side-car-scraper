@@ -16,6 +16,10 @@ It never writes to Redis/MariaDB and keeps no database of its own. The only
 state is an optional in-memory TTL cache (default 30s, set `SIDECAR_CACHE_TTL=0`
 to disable) to avoid hammering the containers.
 
+An **optional reconciler** can push this node's configuration into *another*
+mailcow node through that node's REST API (see [Reconciler](#reconciler-optional)).
+With no target configured the sidecar stays strictly read-only.
+
 ## Why not just use the mailcow REST API?
 
 The official API (`GET /api/v1/get/dkim/{domain}`) returns `privkey: ""` unless
@@ -56,6 +60,13 @@ All settings are environment variables (also read from `.env`):
 | `SIDECAR_DOCKER_BIN` | `docker` | Docker CLI binary. |
 | `SIDECAR_REQUEST_TIMEOUT` | `30` | Seconds per `docker exec`. |
 | `SIDECAR_CACHE_TTL` | `30` | Seconds to cache scraped data (`0` disables). |
+| `SIDECAR_TARGET_URL` | *(empty)* | Reconciler target, e.g. `https://mail.example.org`. Enables the write endpoints. |
+| `SIDECAR_TARGET_API_KEY` | *(empty)* | **`rw`** API key on the target. |
+| `SIDECAR_TARGET_VERIFY_TLS` | `true` | Set `false` for self-signed certs on the target. |
+| `SIDECAR_TARGET_TIMEOUT` | `30` | Seconds for target API calls. |
+| `SIDECAR_PEER_TOKEN` | *(empty)* | Default token for peer sidecars (their `SIDECAR_API_TOKEN`). |
+| `SIDECAR_PEER_VERIFY_TLS` | `true` | Verify TLS when talking to a peer sidecar. |
+| `SIDECAR_PEER_TIMEOUT` | `120` | Seconds for peer push calls. |
 
 `MAILCOW_HOSTNAME`, `DBNAME`, `DBUSER`, `DBPASS`, `REDISPASS`, `HTTPS_PORT`,
 `SPLIT_DKIM_255` and `COMPOSE_PROJECT_NAME` are all read from `mailcow.conf`.
@@ -97,7 +108,13 @@ is set.
 | GET | `/api/v1/dns/{domain}` | DNS records for one domain. |
 | GET | `/api/v1/mailboxes?domain=` | Mailboxes. |
 | GET | `/api/v1/aliases?domain=` | Aliases. |
-| GET | `/api/v1/export` | Everything in one bundle. |
+| GET | `/api/v1/export` | Everything in one bundle (domains, DKIM, DNS, mailboxes, aliases). |
+| GET | `/api/v1/reconcile/target` | Target reachability + version. |
+| POST | `/api/v1/reconcile/plan` | Diff desired state against the target (no writes). |
+| POST | `/api/v1/reconcile/apply` | Execute that diff against the target. |
+| POST | `/api/v1/replicate/peer` | Probe another sidecar (reachability + identity). |
+| POST | `/api/v1/replicate/preview` | Ask a peer what it would change (no writes). |
+| POST | `/api/v1/replicate/push` | Scrape this node and push it to a peer sidecar. |
 
 Examples:
 
@@ -119,6 +136,136 @@ DKIM key response:
   "dkim_txt": "v=DKIM1;k=rsa;t=s;s=email;p=MIIBIjANBgkqhkiG9w0BAQEF..."
 }
 ```
+
+## Reconciler (optional)
+
+Pushes configuration into another mailcow node so a freshly set up instance can
+be provisioned, or so several nodes converge on the same domains.
+
+**Source:** either the local node (scraped read-only from its containers) or a
+supplied `ExportBundle` JSON — e.g. a row from your own database, or the output
+of `GET /api/v1/export`.
+
+**Target:** a mailcow node reached over its REST API. It needs an API key with
+`access='rw'` whose `allow_from` covers this host's source IP (or
+`skip_ip_check=1`). See `SIDECAR_TARGET_*` above.
+
+```bash
+# Dry-run: what would change on the target?
+curl -s -X POST http://127.0.0.1:8800/api/v1/reconcile/plan \
+  -H 'Content-Type: application/json' -d '{}' | jq
+
+# Apply it (also from a stored bundle):
+curl -s -X POST http://127.0.0.1:8800/api/v1/reconcile/apply \
+  -H 'Content-Type: application/json' \
+  -d '{"bundle": { ... }, "prune": false, "include_mailboxes": true}' | jq
+```
+
+Or from the CLI (no HTTP server needed):
+
+```bash
+python -m app.reconcile --target-url https://mail.example.org \
+  --source local --apply            # reads this node, writes the target
+python -m app.reconcile --target-url https://mail.example.org \
+  --source bundle --bundle export.json --prune --apply
+```
+
+Plans never contain DKIM private keys (they are re-read at apply time), so plan
+output is safe to log. `GET /api/v1/reconcile/target` is a quick reachability
+check.
+
+For recurring syncs, `deploy/mailcow-reconcile.service` + `.timer` run the CLI
+every 15 minutes against `SIDECAR_TARGET_URL`.
+
+### What is reconciled
+
+domains · DKIM private keys (`dkim_import`, so signatures match across nodes) ·
+alias domains · aliases · mailboxes (opt-in).
+
+### Limitations to know
+
+- **Mailbox passwords cannot be synced** — mailcow stores only a hash. Created
+  mailboxes get a random password plus `force_pw_update=1`; manage them only
+  with `include_mailboxes: true`.
+- **Deletes only happen with `prune: true`**, and alias deletion is limited to
+  domains you manage.
+- **mailcow is single-master.** This converges *configuration*; it is not
+  replication of mail data (`vmail-vol-1`). For host-level HA use mailcow's
+  cold-standby script instead.
+- **Mail data and DNS targets are per-node.** MX/autodiscover/SRV records point
+  at each node's own `MAILCOW_HOSTNAME`; only the domain/DKIM/mailbox layer is
+  node-independent.
+
+## Self-replication (node → node)
+
+Run this sidecar on **both** nodes. Paste Node 2's URL into Node 1's API, and
+Node 1 ships its whole configuration to Node 2, which provisions its own
+containers.
+
+```
+┌─ Node 1 · full mailcow ─────────────────┐        ┌─ Node 2 · fresh mailcow ────────────────┐
+│  sidecar :8800                          │        │  sidecar :8800                          │
+│                                         │        │                                         │
+│  scrape redis+mysql ──► ExportBundle    │ POST   │  /api/v1/reconcile/apply                │
+│  POST /api/v1/replicate/push ───────────┼───────►│    └─► Node 2's own mailcow REST API    │
+│                                         │ Bearer │         (SIDECAR_TARGET_URL)             │
+└─────────────────────────────────────────┘        └─────────────────────────────────────────┘
+```
+
+The receiver is just the reconciler you already have — Node 2's "target" is its
+**own** mailcow.
+
+### One-time setup on Node 2 (the empty instance)
+
+1. Install mailcow + this sidecar and let it come up.
+2. In Node 2's mailcow UI create an API key with **read-write** access
+   (`Configuration → Access → Edit administrator details → API`). Set
+   `allow_from` to the sidecar host's source IP, or tick *skip IP check*.
+3. Point Node 2's sidecar at its own mailcow:
+
+   ```ini
+   SIDECAR_TARGET_URL=https://127.0.0.1      # or the mailcow hostname
+   SIDECAR_TARGET_API_KEY=<the rw key>
+   SIDECAR_TARGET_VERIFY_TLS=false           # if using a self-signed cert
+   SIDECAR_API_TOKEN=<optional: require a token from Node 1>
+   ```
+
+### Push from Node 1
+
+```bash
+# 1. Check you're talking to the right peer.
+curl -s -X POST http://127.0.0.1:8800/api/v1/replicate/peer \
+  -H 'Content-Type: application/json' \
+  -d '{"peer_url": "https://node2:8800", "peer_token": "node2-token"}' | jq
+
+# 2. Dry-run first: the peer diffs your bundle against its own state, writes nothing.
+curl -s -X POST http://127.0.0.1:8800/api/v1/replicate/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"peer_url": "https://node2:8800", "peer_token": "node2-token"}' | jq '.counts'
+
+# 3. Push it.
+curl -s -X POST http://127.0.0.1:8800/api/v1/replicate/push \
+  -H 'Content-Type: application/json' \
+  -d '{"peer_url": "https://node2:8800", "peer_token": "node2-token",
+       "include_mailboxes": true, "prune": false}' | jq '.peer_result'
+```
+
+`preview` sends your bundle to the peer, so the *peer* computes the diff — only it
+knows its own state. Use it to see exactly what a push would do before pulling
+the trigger.
+
+### Notes
+
+- **Ordering is handled**: domains are created before DKIM imports, alias
+  domains, aliases and mailboxes, so a fresh node provisions cleanly.
+- **The wire carries DKIM private keys** (that's how both nodes sign
+  identically). Use HTTPS and always set `SIDECAR_API_TOKEN` on the peer.
+- **Node 2 stays empty of mail** — this replicates configuration only. Copy
+  `vmail-vol-1` separately if you want the actual messages.
+- Node 2 can be re-pushed to at any time; the diff means it's idempotent, and
+  the second push is a no-op.
+- The receiver needs no Docker access for the write path — it only needs its own
+  mailcow API key.
 
 ## Tests
 
