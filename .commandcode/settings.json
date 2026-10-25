@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(ls -la; git status 2>/dev/null | head -30; python3 --version; docker --version 2>/dev/null; docker compose version 2>/dev/null)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

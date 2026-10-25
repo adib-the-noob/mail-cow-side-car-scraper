@@ -1,0 +1,1 @@
+- Prefers read-only, stateless services: the app should not persist data in any database or local store — just a simple REST API that serves data on demand. Confidence: 0.6

@@ -1,0 +1,21 @@
+[Unit]
+Description=mailcow scraper sidecar (read-only domain/DKIM/DNS JSON API)
+Documentation=https://github.com/mailcow/mailcow-dockerized
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+# Adjust to where you cloned the repo:
+WorkingDirectory=/opt/mailcow-scraper-sidecar
+EnvironmentFile=-/opt/mailcow-scraper-sidecar/.env
+# Root is required for access to the Docker socket. Alternatively, drop this to
+# a dedicated user that is a member of the `docker` group.
+User=root
+Group=root
+ExecStart=/opt/mailcow-scraper-sidecar/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8800
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
